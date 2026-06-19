@@ -318,79 +318,105 @@ function registerBotHandlers(user, bot) {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
 
-    if (payload.startsWith('sub_')) {
-      // FIX: look up the pending subscriber in MongoDB instead of the in-memory map.
-      // This means subscription deep links work correctly even after a server restart.
-      const sub = await PendingSubscriber.findOne({ payload: payload, userId: user.id });
+    try {
+      if (payload.startsWith('sub_')) {
+        // Look up pending subscriber by payload only — payload is a globally unique UUID
+        // slice so no secondary filter is needed. Removing the `userId` filter prevents
+        // silent mismatches caused by Mongoose's .id virtual vs custom id field ambiguity.
+        const sub = await PendingSubscriber.findOne({ payload: payload });
 
-      if (sub) {
-        let targetContact = await Contact.findOne({ userId: user.id, telegramChatId: chatId });
-        const contactsByEmail = await Contact.find({ userId: user.id, contact: sub.contact });
+        if (sub) {
+          // Always use sub.userId (stored at subscribe time) as the authoritative owner id.
+          const ownerId = sub.userId;
 
-        if (!targetContact) {
-          targetContact = contactsByEmail.find(function(c) { return c.status === 'subscribed'; }) ||
-                          contactsByEmail.find(function(c) { return c.shortId === sub.shortId; }) ||
-                          contactsByEmail[0];
-        }
+          let targetContact = await Contact.findOne({ userId: ownerId, telegramChatId: chatId });
+          const contactsByEmail = await Contact.find({ userId: ownerId, contact: sub.contact });
 
-        if (!targetContact) {
-          targetContact = new Contact({
-            userId: user.id,
-            shortId: sub.shortId,
-            name: sub.name,
-            contact: sub.contact,
-            telegramChatId: chatId,
-            status: 'subscribed',
-            submittedAt: new Date(),
-            subscribedAt: new Date()
+          if (!targetContact) {
+            targetContact = contactsByEmail.find(function(c) { return c.status === 'subscribed'; }) ||
+                            contactsByEmail.find(function(c) { return c.shortId === sub.shortId; }) ||
+                            contactsByEmail[0] ||
+                            null;
+          }
+
+          if (!targetContact) {
+            targetContact = new Contact({
+              userId: ownerId,
+              shortId: sub.shortId,
+              name: sub.name,
+              contact: sub.contact,
+              telegramChatId: chatId,
+              status: 'subscribed',
+              submittedAt: new Date(),
+              subscribedAt: new Date()
+            });
+          } else {
+            targetContact.name = sub.name;
+            targetContact.contact = sub.contact;
+            targetContact.shortId = sub.shortId;
+            targetContact.telegramChatId = chatId;
+            targetContact.status = 'subscribed';
+            targetContact.subscribedAt = targetContact.subscribedAt || new Date();
+            targetContact.submittedAt = new Date();
+          }
+
+          await targetContact.save();
+
+          await Contact.deleteMany({
+            userId: ownerId,
+            $or: [
+              { contact: sub.contact, _id: { $ne: targetContact._id } },
+              { telegramChatId: chatId, _id: { $ne: targetContact._id } }
+            ]
           });
-        } else {
-          targetContact.name = sub.name;
-          targetContact.contact = sub.contact;
-          targetContact.shortId = sub.shortId;
-          targetContact.telegramChatId = chatId;
-          targetContact.status = 'subscribed';
-          targetContact.subscribedAt = targetContact.subscribedAt || new Date();
-          targetContact.submittedAt = new Date();
+
+          await PendingSubscriber.deleteOne({ payload: payload });
+
+          const form = await FormPage.findOne({ shortId: sub.shortId });
+          let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
+
+          if (form && form.welcomeMessage && form.welcomeMessage.trim()) {
+            welcomeText = form.welcomeMessage
+              .replace(/\{name\}/gi, '<b>' + escapeHtml(sub.name) + '</b>')
+              .replace(/\{contact\}/gi, escapeHtml(sub.contact));
+          }
+
+          invalidateUserCache(ownerId, 'contacts');
+          await ctx.replyWithHTML(welcomeText);
+          return;
         }
 
-        await targetContact.save();
-
-        await Contact.deleteMany({
-          userId: user.id,
-          $or: [
-            { contact: sub.contact, _id: { $ne: targetContact._id } },
-            { telegramChatId: chatId, _id: { $ne: targetContact._id } }
-          ]
-        });
-
-        // FIX: delete from DB instead of in-memory map
-        await PendingSubscriber.deleteOne({ payload: payload });
-
-        const form = await FormPage.findOne({ shortId: sub.shortId });
-        let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
-
-        if (form && form.welcomeMessage && form.welcomeMessage.trim()) {
-          welcomeText = form.welcomeMessage
-            .replace(/\{name\}/gi, '<b>' + escapeHtml(sub.name) + '</b>')
-            .replace(/\{contact\}/gi, escapeHtml(sub.contact));
-        }
-
-        invalidateUserCache(user.id, 'contacts');
-        await ctx.replyWithHTML(welcomeText);
+        // Payload started with sub_ but wasn't found — token expired or already used
+        await ctx.replyWithHTML('<b>This subscription link has expired.</b>\n\nPlease go back to the form and subscribe again.');
         return;
       }
-    }
 
-    if (payload === user.id) {
-      user.telegramChatId = chatId;
-      user.isTelegramConnected = true;
-      await user.save();
-      await ctx.replyWithHTML('<b>Sendm 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
-      return;
-    }
+      // Re-fetch owner from DB here so we never use a stale closed-over object
+      // for the 2FA connection case (avoids chatId being written to wrong document).
+      const freshOwner = await User.findOne({ id: user.id });
+      if (freshOwner && payload === freshOwner.id) {
+        freshOwner.telegramChatId = chatId;
+        freshOwner.isTelegramConnected = true;
+        await freshOwner.save();
+        // Keep the closed-over user object in sync so other handlers (status cmd) are correct
+        user.telegramChatId = chatId;
+        user.isTelegramConnected = true;
+        await ctx.replyWithHTML('<b>Sendm 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
+        return;
+      }
 
-    await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
+      await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
+
+    } catch (err) {
+      // Log the error so it is visible in server logs instead of disappearing silently.
+      // Telegraf's bot.catch does NOT catch errors thrown inside async command handlers.
+      console.error('Error in bot.start handler for ' + user.email + ':', err);
+      try {
+        await ctx.replyWithHTML('Something went wrong. Please try again.');
+      } catch (replyErr) {
+        console.error('Also failed to send error reply:', replyErr.message);
+      }
+    }
   });
 
   bot.command('status', async function(ctx) {
@@ -1391,11 +1417,12 @@ async function main() {
       await contact.save();
     }
 
-    // FIX: save pending subscriber to MongoDB so it survives restarts.
-    // Use upsert so re-submissions by the same contact don't fail with duplicate key.
+    // Save pending subscriber to MongoDB so it survives server restarts.
+    // $set is required — without it Mongoose treats the update as a full replacement,
+    // which conflicts with the unique index and can silently drop the userId field.
     await PendingSubscriber.findOneAndUpdate(
       { payload: payload },
-      { payload: payload, userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue, createdAt: new Date() },
+      { $set: { userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue, createdAt: new Date() } },
       { upsert: true, new: true }
     );
 
