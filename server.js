@@ -300,6 +300,7 @@ const BroadcastDaily = mongoose.model('BroadcastDaily', broadcastDailySchema);
 // In-memory helpers
 const activeBots = new Map();
 const resetTokens = new Map();
+const pendingSubscribers = new Map(); // primary store; PendingSubscriber (MongoDB) is the restart-survival fallback
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
 function registerBotHandlers(user, bot) {
@@ -320,28 +321,32 @@ function registerBotHandlers(user, bot) {
 
     try {
       if (payload.startsWith('sub_')) {
-        // Look up pending subscriber by payload only — payload is a globally unique UUID
-        // slice so no secondary filter is needed. Removing the `userId` filter prevents
-        // silent mismatches caused by Mongoose's .id virtual vs custom id field ambiguity.
-        const sub = await PendingSubscriber.findOne({ payload: payload });
+        // Check in-memory map first (fast path, same as Express version).
+        // Fall back to MongoDB for tokens that survived a server restart.
+        let sub = pendingSubscribers.has(payload) ? pendingSubscribers.get(payload) : null;
+        let fromDb = false;
 
-        if (sub) {
-          // Always use sub.userId (stored at subscribe time) as the authoritative owner id.
-          const ownerId = sub.userId;
+        if (!sub) {
+          const dbSub = await PendingSubscriber.findOne({ payload: payload });
+          if (dbSub) {
+            sub = { userId: dbSub.userId, shortId: dbSub.shortId, name: dbSub.name, contact: dbSub.contact };
+            fromDb = true;
+          }
+        }
 
-          let targetContact = await Contact.findOne({ userId: ownerId, telegramChatId: chatId });
-          const contactsByEmail = await Contact.find({ userId: ownerId, contact: sub.contact });
+        if (sub && sub.userId === user.id) {
+          let targetContact = await Contact.findOne({ userId: user.id, telegramChatId: chatId });
+          const contactsByEmail = await Contact.find({ userId: user.id, contact: sub.contact });
 
           if (!targetContact) {
             targetContact = contactsByEmail.find(function(c) { return c.status === 'subscribed'; }) ||
                             contactsByEmail.find(function(c) { return c.shortId === sub.shortId; }) ||
-                            contactsByEmail[0] ||
-                            null;
+                            contactsByEmail[0];
           }
 
           if (!targetContact) {
             targetContact = new Contact({
-              userId: ownerId,
+              userId: user.id,
               shortId: sub.shortId,
               name: sub.name,
               contact: sub.contact,
@@ -363,14 +368,21 @@ function registerBotHandlers(user, bot) {
           await targetContact.save();
 
           await Contact.deleteMany({
-            userId: ownerId,
+            userId: user.id,
             $or: [
               { contact: sub.contact, _id: { $ne: targetContact._id } },
               { telegramChatId: chatId, _id: { $ne: targetContact._id } }
             ]
           });
 
-          await PendingSubscriber.deleteOne({ payload: payload });
+          // Clean up both stores
+          pendingSubscribers.delete(payload);
+          if (fromDb) {
+            await PendingSubscriber.deleteOne({ payload: payload });
+          } else {
+            // Also delete from DB in case a concurrent request wrote it there
+            PendingSubscriber.deleteOne({ payload: payload }).catch(function() {});
+          }
 
           const form = await FormPage.findOne({ shortId: sub.shortId });
           let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
@@ -381,26 +393,16 @@ function registerBotHandlers(user, bot) {
               .replace(/\{contact\}/gi, escapeHtml(sub.contact));
           }
 
-          invalidateUserCache(ownerId, 'contacts');
+          invalidateUserCache(user.id, 'contacts');
           await ctx.replyWithHTML(welcomeText);
           return;
         }
-
-        // Payload started with sub_ but wasn't found — token expired or already used
-        await ctx.replyWithHTML('<b>This subscription link has expired.</b>\n\nPlease go back to the form and subscribe again.');
-        return;
       }
 
-      // Re-fetch owner from DB here so we never use a stale closed-over object
-      // for the 2FA connection case (avoids chatId being written to wrong document).
-      const freshOwner = await User.findOne({ id: user.id });
-      if (freshOwner && payload === freshOwner.id) {
-        freshOwner.telegramChatId = chatId;
-        freshOwner.isTelegramConnected = true;
-        await freshOwner.save();
-        // Keep the closed-over user object in sync so other handlers (status cmd) are correct
+      if (payload === user.id) {
         user.telegramChatId = chatId;
         user.isTelegramConnected = true;
+        await user.save();
         await ctx.replyWithHTML('<b>Sendm 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
         return;
       }
@@ -408,8 +410,8 @@ function registerBotHandlers(user, bot) {
       await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
 
     } catch (err) {
-      // Log the error so it is visible in server logs instead of disappearing silently.
-      // Telegraf's bot.catch does NOT catch errors thrown inside async command handlers.
+      // Telegraf\'s bot.catch does NOT catch errors thrown inside async command handlers —
+      // log here so failures are visible in server logs instead of disappearing silently.
       console.error('Error in bot.start handler for ' + user.email + ':', err);
       try {
         await ctx.replyWithHTML('Something went wrong. Please try again.');
@@ -1417,14 +1419,26 @@ async function main() {
       await contact.save();
     }
 
-    // Save pending subscriber to MongoDB so it survives server restarts.
-    // $set is required — without it Mongoose treats the update as a full replacement,
-    // which conflicts with the unique index and can silently drop the userId field.
-    await PendingSubscriber.findOneAndUpdate(
+    // Write to in-memory map first (same as Express — this is what the bot.start
+    // handler checks first and is the reason the Express version works reliably).
+    // Also write to MongoDB as a fallback for tokens that need to survive a restart.
+    const subData = {
+      userId: owner.id,
+      shortId: shortId,
+      name: name.trim(),
+      contact: contactValue,
+      createdAt: Date.now()
+    };
+    pendingSubscribers.set(payload, subData);
+
+    // Fire-and-forget the DB write — don't let a MongoDB hiccup block the response.
+    PendingSubscriber.findOneAndUpdate(
       { payload: payload },
       { $set: { userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue, createdAt: new Date() } },
       { upsert: true, new: true }
-    );
+    ).catch(function(err) {
+      console.error('Failed to persist PendingSubscriber to DB (in-memory fallback still active):', err.message);
+    });
 
     invalidateUserCache(owner.id, 'contacts');
 
@@ -1645,8 +1659,16 @@ async function main() {
   fastify.setNotFoundHandler(async function(request, reply) { reply.code(404); return reply.view('404'); });
 
   // ==================== CLEANUP ====================
-  // FIX: PendingSubscriber cleanup is now handled by MongoDB TTL index (expires: 1800).
-  // No manual setInterval needed.
+  // Purge expired in-memory pending subscribers every hour (same as Express version).
+  // MongoDB TTL index (expires: 1800) handles the DB-side cleanup automatically.
+  setInterval(function() {
+    const now = Date.now();
+    for (const [key, data] of pendingSubscribers.entries()) {
+      if (now - data.createdAt > 30 * 60 * 1000) {
+        pendingSubscribers.delete(key);
+      }
+    }
+  }, 60 * 60 * 1000);
 
   // ==================== STARTUP ====================
   async function loadAdminSettings() {
