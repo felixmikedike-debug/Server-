@@ -232,7 +232,7 @@ const pendingSubscriberSchema = new mongoose.Schema({
   shortId: { type: String, required: true },
   name: { type: String, required: true },
   contact: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now, expires: 1800 }
+  createdAt: { type: Date, default: Date.now, expires: 1800 } // auto-delete after 30 min
 });
 
 pendingSubscriberSchema.index({ payload: 1 });
@@ -297,133 +297,125 @@ const BroadcastDaily = mongoose.model('BroadcastDaily', broadcastDailySchema);
 // In-memory helpers
 const activeBots = new Map();
 const resetTokens = new Map();
-const pendingSubscribers = new Map();
+const pendingSubscribers = new Map(); // primary store; PendingSubscriber (MongoDB) is the restart-survival fallback
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
-function registerBotHandlers(user, bot) {
+function registerBotHandlers(ownerUser, bot) {
   bot.webhookReply = false;
   bot.options.webhookReply = false;
 
   bot.catch(function(err) {
     if (err.message && err.message.includes('Bot is not running')) {
-      console.warn('Ignored expected "Bot is not running" warning in webhook mode for ' + user.email);
+      console.warn('Ignored expected "Bot is not running" warning in webhook mode for ' + ownerUser.email);
     } else {
-      console.error('Bot error for ' + user.email + ':', err);
+      console.error('Bot error for ' + ownerUser.email + ':', err);
     }
   });
 
   bot.start(async function(ctx) {
-    // FIX: ctx.startPayload is unreliable in webhook mode — Telegraf does not
-    // always populate it when processing updates via handleUpdate(). Parse the
-    // raw message text directly as the authoritative source, and fall back to
-    // ctx.startPayload only if the text parse yields nothing.
-    let payload = '';
-    if (ctx.message && ctx.message.text) {
-      const textParts = ctx.message.text.trim().split(' ');
-      if (textParts.length > 1) payload = textParts[1].trim();
-    }
-    if (!payload) payload = ctx.startPayload || '';
-
+    const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
 
-    console.log('bot.start fired for ' + user.email + ' | payload: "' + payload + '" | chatId: ' + chatId);
+    console.log(`[BOT START] Payload: "${payload}" for chat ${chatId} (bot owner: ${ownerUser.email})`);
 
     try {
       if (payload.startsWith('sub_')) {
-        // Check in-memory map first (fast path).
-        // Fall back to MongoDB for tokens that survived a server restart.
+        // Check in-memory first (fast)
         let sub = pendingSubscribers.has(payload) ? pendingSubscribers.get(payload) : null;
         let fromDb = false;
+        let dbSub = null;
 
         if (!sub) {
-          const dbSub = await PendingSubscriber.findOne({ payload: payload });
+          dbSub = await PendingSubscriber.findOne({ payload: payload });
           if (dbSub) {
-            sub = { userId: dbSub.userId, shortId: dbSub.shortId, name: dbSub.name, contact: dbSub.contact };
+            sub = { 
+              userId: dbSub.userId, 
+              shortId: dbSub.shortId, 
+              name: dbSub.name, 
+              contact: dbSub.contact 
+            };
             fromDb = true;
-            console.log('Loaded pending subscriber from DB for payload: ' + payload);
           }
         }
 
-        if (!sub) {
-          console.warn('No pending subscriber found for payload: ' + payload + ' (may have expired or already used)');
-          await ctx.replyWithHTML('<b>This subscription link has expired or already been used.</b>\n\nPlease go back to the form and submit again.');
-          return;
-        }
+        if (sub && sub.userId === ownerUser.id) {
+          console.log(`[SUBSCRIPTION] Processing sub_ payload for \( {sub.name} ( \){sub.contact})`);
 
-        if (sub.userId !== user.id) {
-          console.warn('Payload userId mismatch: sub.userId=' + sub.userId + ' user.id=' + user.id);
-          await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
-          return;
-        }
-
-        let targetContact = await Contact.findOne({ userId: user.id, telegramChatId: chatId });
-        const contactsByValue = await Contact.find({ userId: user.id, contact: sub.contact });
-
-        if (!targetContact) {
-          targetContact = contactsByValue.find(function(c) { return c.status === 'subscribed'; }) ||
-                          contactsByValue.find(function(c) { return c.shortId === sub.shortId; }) ||
-                          contactsByValue[0];
-        }
-
-        if (!targetContact) {
-          targetContact = new Contact({
-            userId: user.id,
-            shortId: sub.shortId,
-            name: sub.name,
-            contact: sub.contact,
-            telegramChatId: chatId,
-            status: 'subscribed',
-            submittedAt: new Date(),
-            subscribedAt: new Date()
+          let targetContact = await Contact.findOne({ 
+            userId: ownerUser.id, 
+            telegramChatId: chatId 
           });
+
+          const contactsByEmail = await Contact.find({ 
+            userId: ownerUser.id, 
+            contact: sub.contact 
+          });
+
+          if (!targetContact) {
+            targetContact = contactsByEmail.find(c => c.status === 'subscribed') ||
+                            contactsByEmail.find(c => c.shortId === sub.shortId) ||
+                            contactsByEmail[0];
+          }
+
+          if (!targetContact) {
+            targetContact = new Contact({
+              userId: ownerUser.id,
+              shortId: sub.shortId,
+              name: sub.name,
+              contact: sub.contact,
+              telegramChatId: chatId,
+              status: 'subscribed',
+              submittedAt: new Date(),
+              subscribedAt: new Date()
+            });
+          } else {
+            targetContact.name = sub.name;
+            targetContact.contact = sub.contact;
+            targetContact.shortId = sub.shortId;
+            targetContact.telegramChatId = chatId;
+            targetContact.status = 'subscribed';
+            targetContact.subscribedAt = targetContact.subscribedAt || new Date();
+            targetContact.submittedAt = new Date();
+          }
+
+          await targetContact.save();
+          console.log(`[SUBSCRIPTION] Contact saved as subscribed: ${targetContact.contact}`);
+
+          // Clean duplicates
+          await Contact.deleteMany({
+            userId: ownerUser.id,
+            $or: [
+              { contact: sub.contact, _id: { $ne: targetContact._id } },
+              { telegramChatId: chatId, _id: { $ne: targetContact._id } }
+            ]
+          });
+
+          // Clean up pending
+          pendingSubscribers.delete(payload);
+          await PendingSubscriber.deleteOne({ payload: payload }).catch(() => {});
+
+          const form = await FormPage.findOne({ shortId: sub.shortId });
+          let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
+
+          if (form && form.welcomeMessage && form.welcomeMessage.trim()) {
+            welcomeText = form.welcomeMessage
+              .replace(/\{name\}/gi, '<b>' + escapeHtml(sub.name) + '</b>')
+              .replace(/\{contact\}/gi, escapeHtml(sub.contact));
+          }
+
+          invalidateUserCache(ownerUser.id, 'contacts');
+          await ctx.replyWithHTML(welcomeText);
+          console.log(`[SUBSCRIPTION] Custom welcome sent for ${sub.name}`);
+          return;
         } else {
-          targetContact.name = sub.name;
-          targetContact.contact = sub.contact;
-          targetContact.shortId = sub.shortId;
-          targetContact.telegramChatId = chatId;
-          targetContact.status = 'subscribed';
-          targetContact.subscribedAt = targetContact.subscribedAt || new Date();
-          targetContact.submittedAt = new Date();
+          console.warn(`[SUBSCRIPTION] Payload found but userId mismatch or no sub data. Expected owner: ${ownerUser.id}, got: ${sub ? sub.userId : 'none'}`);
         }
-
-        await targetContact.save();
-
-        // Remove duplicate contacts sharing the same contact value or chatId
-        await Contact.deleteMany({
-          userId: user.id,
-          $or: [
-            { contact: sub.contact, _id: { $ne: targetContact._id } },
-            { telegramChatId: chatId, _id: { $ne: targetContact._id } }
-          ]
-        });
-
-        // Clean up both stores
-        pendingSubscribers.delete(payload);
-        if (fromDb) {
-          await PendingSubscriber.deleteOne({ payload: payload });
-        } else {
-          PendingSubscriber.deleteOne({ payload: payload }).catch(function() {});
-        }
-
-        const form = await FormPage.findOne({ shortId: sub.shortId });
-        let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
-
-        if (form && form.welcomeMessage && form.welcomeMessage.trim()) {
-          welcomeText = form.welcomeMessage
-            .replace(/\{name\}/gi, '<b>' + escapeHtml(sub.name) + '</b>')
-            .replace(/\{contact\}/gi, escapeHtml(sub.contact));
-        }
-
-        invalidateUserCache(user.id, 'contacts');
-        console.log('✅ Subscriber confirmed: ' + sub.contact + ' → chatId ' + chatId + ' for user ' + user.email);
-        await ctx.replyWithHTML(welcomeText);
-        return;
       }
 
-      if (payload === user.id) {
-        user.telegramChatId = chatId;
-        user.isTelegramConnected = true;
-        await user.save();
+      if (payload === ownerUser.id) {
+        ownerUser.telegramChatId = chatId;
+        ownerUser.isTelegramConnected = true;
+        await ownerUser.save();
         await ctx.replyWithHTML('<b>Sendm 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
         return;
       }
@@ -431,7 +423,7 @@ function registerBotHandlers(user, bot) {
       await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
 
     } catch (err) {
-      console.error('Error in bot.start handler for ' + user.email + ':', err);
+      console.error('Error in bot.start handler for ' + ownerUser.email + ':', err);
       try {
         await ctx.replyWithHTML('Something went wrong. Please try again.');
       } catch (replyErr) {
@@ -441,10 +433,10 @@ function registerBotHandlers(user, bot) {
   });
 
   bot.command('status', async function(ctx) {
-    await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + user.email + '</code>\nStatus: <b>' + (user.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
+    await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + ownerUser.email + '</code>\nStatus: <b>' + (ownerUser.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
   });
 
-  activeBots.set(user.id, bot);
+  activeBots.set(ownerUser.id, bot);
 }
 
 async function setupBotWebhook(user) {
@@ -506,12 +498,17 @@ function registerBot(user) {
   }
 
   const bot = new Telegraf(user.telegramBotToken);
-  registerBotHandlers(user, bot);
+  registerBotHandlers(user, bot);  // Pass fresh user document
   console.log('Bot handlers registered for ' + user.email + ' (lazy webhook mode)');
 }
 
 async function hydrateBot(user) {
   if (!activeBots.has(user.id)) {
+    // Ensure we have fresh user data
+    const freshUser = await User.findOne({ id: user.id });
+    if (freshUser) {
+      user = freshUser;
+    }
     registerBot(user);
     setupBotWebhook(user).catch(function(err) {
       console.error('Background webhook setup failed for ' + user.email + ':', err.message);
@@ -644,17 +641,12 @@ async function incrementDailyBroadcast(userId) {
     return record.count;
   } catch (err) {
     if (err.code === 11000) {
-      try {
-        const record = await BroadcastDaily.findOneAndUpdate(
-          { userId: userId, date: today },
-          { $inc: { count: 1 } },
-          { new: true }
-        );
-        return record ? record.count : 1;
-      } catch (retryErr) {
-        console.error('incrementDailyBroadcast retry failed for ' + userId + ':', retryErr.message);
-        throw retryErr;
-      }
+      const record = await BroadcastDaily.findOneAndUpdate(
+        { userId: userId, date: today },
+        { $inc: { count: 1 } },
+        { new: true }
+      );
+      return record ? record.count : 1;
     }
     console.error('incrementDailyBroadcast failed for ' + userId + ':', err.message);
     throw err;
@@ -924,6 +916,7 @@ async function main() {
   // ==================== WEBHOOK ENDPOINT ====================
   fastify.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async function(request, reply) {
     const userId = request.params.userId;
+    console.log(`[WEBHOOK] Received update for userId: ${userId}`);
 
     let bot = activeBots.get(userId);
     if (!bot) {
@@ -1376,15 +1369,15 @@ async function main() {
     reply.send({ success: true });
   });
 
-  // ==================== SUBSCRIBE & CONTACTS ====================
+  // ==================== SUBSCRIBE & CONTACTS (FIXED) ====================
   fastify.post('/api/subscribe/:shortId', { config: formSubmitLimiterConfig }, async function(request, reply) {
     const shortId = request.params.shortId;
-    const { name, email } = request.body;
+    const { name, email: contactValueRaw } = request.body;  // renamed for clarity
 
     if (!name || !name.trim()) return reply.code(400).send({ error: 'Name is required' });
-    if (!email || !email.trim()) return reply.code(400).send({ error: 'Contact is required' });
+    if (!contactValueRaw || !contactValueRaw.trim()) return reply.code(400).send({ error: 'Contact is required' });
 
-    const contactValue = email.trim();
+    const contactValue = contactValueRaw.trim();
     if (!CONTACT_REGEX.test(contactValue)) return reply.code(400).send({ error: 'Contact must be a valid email address or phone number' });
 
     const form = await FormPage.findOne({ shortId: shortId });
@@ -1395,6 +1388,7 @@ async function main() {
 
     const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
 
+    // Ensure contact record exists (pending)
     let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
 
     if (contact) {
@@ -1404,8 +1398,12 @@ async function main() {
       await contact.save();
     } else {
       contact = new Contact({
-        userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue,
-        status: 'pending', submittedAt: new Date()
+        userId: owner.id, 
+        shortId: shortId, 
+        name: name.trim(), 
+        contact: contactValue,
+        status: 'pending', 
+        submittedAt: new Date()
       });
       await contact.save();
     }
@@ -1417,16 +1415,17 @@ async function main() {
       contact: contactValue,
       createdAt: Date.now()
     };
-    pendingSubscribers.set(payload, subData);
 
-    // Fire-and-forget DB write as restart-survival fallback
-    PendingSubscriber.findOneAndUpdate(
+    // CRITICAL FIX: Await DB write to eliminate race condition
+    await PendingSubscriber.findOneAndUpdate(
       { payload: payload },
-      { $set: { userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue, createdAt: new Date() } },
+      { $set: subData },
       { upsert: true, new: true }
-    ).catch(function(err) {
-      console.error('Failed to persist PendingSubscriber to DB (in-memory fallback still active):', err.message);
-    });
+    );
+    console.log(`[SUBSCRIBE] Pending subscriber persisted to DB: ${payload}`);
+
+    // Also keep in-memory
+    pendingSubscribers.set(payload, subData);
 
     invalidateUserCache(owner.id, 'contacts');
 
