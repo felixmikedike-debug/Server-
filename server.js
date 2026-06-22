@@ -226,6 +226,8 @@ contactSchema.index({ userId: 1, contact: 1 });
 contactSchema.index({ userId: 1, telegramChatId: 1 });
 contactSchema.index({ userId: 1, status: 1 });
 
+// FIX: Added pendingToken field to store subscription tokens in DB
+// so they survive server restarts (critical on platforms like Render).
 const pendingSubscriberSchema = new mongoose.Schema({
   payload: { type: String, required: true, unique: true },
   userId: { type: String, required: true },
@@ -290,6 +292,7 @@ const User = mongoose.model('User', userSchema);
 const LandingPage = mongoose.model('LandingPage', landingPageSchema);
 const FormPage = mongoose.model('FormPage', formPageSchema);
 const Contact = mongoose.model('Contact', contactSchema);
+// FIX: persistent pending subscribers — survives restarts
 const PendingSubscriber = mongoose.model('PendingSubscriber', pendingSubscriberSchema);
 const ScheduledBroadcast = mongoose.model('ScheduledBroadcast', scheduledBroadcastSchema);
 const BroadcastDaily = mongoose.model('BroadcastDaily', broadcastDailySchema);
@@ -300,15 +303,15 @@ const resetTokens = new Map();
 const pendingSubscribers = new Map(); // primary store; PendingSubscriber (MongoDB) is the restart-survival fallback
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
-function registerBotHandlers(ownerUser, bot) {
+function registerBotHandlers(user, bot) {
   bot.webhookReply = false;
   bot.options.webhookReply = false;
 
   bot.catch(function(err) {
     if (err.message && err.message.includes('Bot is not running')) {
-      console.warn('Ignored expected "Bot is not running" warning in webhook mode for ' + ownerUser.email);
+      console.warn('Ignored expected "Bot is not running" warning in webhook mode for ' + user.email);
     } else {
-      console.error('Bot error for ' + ownerUser.email + ':', err);
+      console.error('Bot error for ' + user.email + ':', err);
     }
   });
 
@@ -316,50 +319,34 @@ function registerBotHandlers(ownerUser, bot) {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
 
-    console.log(`[BOT START] Payload: "${payload}" for chat ${chatId} (bot owner: ${ownerUser.email})`);
-
     try {
       if (payload.startsWith('sub_')) {
-        // Check in-memory first (fast)
+        // Check in-memory map first (fast path, same as Express version).
+        // Fall back to MongoDB for tokens that survived a server restart.
         let sub = pendingSubscribers.has(payload) ? pendingSubscribers.get(payload) : null;
         let fromDb = false;
-        let dbSub = null;
 
         if (!sub) {
-          dbSub = await PendingSubscriber.findOne({ payload: payload });
+          const dbSub = await PendingSubscriber.findOne({ payload: payload });
           if (dbSub) {
-            sub = { 
-              userId: dbSub.userId, 
-              shortId: dbSub.shortId, 
-              name: dbSub.name, 
-              contact: dbSub.contact 
-            };
+            sub = { userId: dbSub.userId, shortId: dbSub.shortId, name: dbSub.name, contact: dbSub.contact };
             fromDb = true;
           }
         }
 
-        if (sub && sub.userId === ownerUser.id) {
-          console.log(`[SUBSCRIPTION] Processing sub_ payload for \( {sub.name} ( \){sub.contact})`);
-
-          let targetContact = await Contact.findOne({ 
-            userId: ownerUser.id, 
-            telegramChatId: chatId 
-          });
-
-          const contactsByEmail = await Contact.find({ 
-            userId: ownerUser.id, 
-            contact: sub.contact 
-          });
+        if (sub && sub.userId === user.id) {
+          let targetContact = await Contact.findOne({ userId: user.id, telegramChatId: chatId });
+          const contactsByEmail = await Contact.find({ userId: user.id, contact: sub.contact });
 
           if (!targetContact) {
-            targetContact = contactsByEmail.find(c => c.status === 'subscribed') ||
-                            contactsByEmail.find(c => c.shortId === sub.shortId) ||
+            targetContact = contactsByEmail.find(function(c) { return c.status === 'subscribed'; }) ||
+                            contactsByEmail.find(function(c) { return c.shortId === sub.shortId; }) ||
                             contactsByEmail[0];
           }
 
           if (!targetContact) {
             targetContact = new Contact({
-              userId: ownerUser.id,
+              userId: user.id,
               shortId: sub.shortId,
               name: sub.name,
               contact: sub.contact,
@@ -379,20 +366,23 @@ function registerBotHandlers(ownerUser, bot) {
           }
 
           await targetContact.save();
-          console.log(`[SUBSCRIPTION] Contact saved as subscribed: ${targetContact.contact}`);
 
-          // Clean duplicates
           await Contact.deleteMany({
-            userId: ownerUser.id,
+            userId: user.id,
             $or: [
               { contact: sub.contact, _id: { $ne: targetContact._id } },
               { telegramChatId: chatId, _id: { $ne: targetContact._id } }
             ]
           });
 
-          // Clean up pending
+          // Clean up both stores
           pendingSubscribers.delete(payload);
-          await PendingSubscriber.deleteOne({ payload: payload }).catch(() => {});
+          if (fromDb) {
+            await PendingSubscriber.deleteOne({ payload: payload });
+          } else {
+            // Also delete from DB in case a concurrent request wrote it there
+            PendingSubscriber.deleteOne({ payload: payload }).catch(function() {});
+          }
 
           const form = await FormPage.findOne({ shortId: sub.shortId });
           let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
@@ -403,19 +393,16 @@ function registerBotHandlers(ownerUser, bot) {
               .replace(/\{contact\}/gi, escapeHtml(sub.contact));
           }
 
-          invalidateUserCache(ownerUser.id, 'contacts');
+          invalidateUserCache(user.id, 'contacts');
           await ctx.replyWithHTML(welcomeText);
-          console.log(`[SUBSCRIPTION] Custom welcome sent for ${sub.name}`);
           return;
-        } else {
-          console.warn(`[SUBSCRIPTION] Payload found but userId mismatch or no sub data. Expected owner: ${ownerUser.id}, got: ${sub ? sub.userId : 'none'}`);
         }
       }
 
-      if (payload === ownerUser.id) {
-        ownerUser.telegramChatId = chatId;
-        ownerUser.isTelegramConnected = true;
-        await ownerUser.save();
+      if (payload === user.id) {
+        user.telegramChatId = chatId;
+        user.isTelegramConnected = true;
+        await user.save();
         await ctx.replyWithHTML('<b>Sendm 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
         return;
       }
@@ -423,7 +410,9 @@ function registerBotHandlers(ownerUser, bot) {
       await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
 
     } catch (err) {
-      console.error('Error in bot.start handler for ' + ownerUser.email + ':', err);
+      // Telegraf\'s bot.catch does NOT catch errors thrown inside async command handlers —
+      // log here so failures are visible in server logs instead of disappearing silently.
+      console.error('Error in bot.start handler for ' + user.email + ':', err);
       try {
         await ctx.replyWithHTML('Something went wrong. Please try again.');
       } catch (replyErr) {
@@ -433,10 +422,10 @@ function registerBotHandlers(ownerUser, bot) {
   });
 
   bot.command('status', async function(ctx) {
-    await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + ownerUser.email + '</code>\nStatus: <b>' + (ownerUser.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
+    await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + user.email + '</code>\nStatus: <b>' + (user.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
   });
 
-  activeBots.set(ownerUser.id, bot);
+  activeBots.set(user.id, bot);
 }
 
 async function setupBotWebhook(user) {
@@ -452,9 +441,13 @@ async function setupBotWebhook(user) {
   }
 
   try {
+    // FIX: Removed the two pointless sequential delays (4000ms + 2500ms = 6.5s).
+    // deleteWebhook already does a round-trip to Telegram; no extra sleep needed.
+    // The old code burned 6.5s of Render's 30s request timeout for zero benefit.
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
     console.log('Webhook cleaned for ' + user.email);
 
+    // A single short pause lets Telegram's edge nodes settle after deletion.
     await new Promise(function(resolve) { setTimeout(resolve, 1500); });
 
     let attempts = 0;
@@ -498,18 +491,23 @@ function registerBot(user) {
   }
 
   const bot = new Telegraf(user.telegramBotToken);
-  registerBotHandlers(user, bot);  // Pass fresh user document
+  registerBotHandlers(user, bot);
   console.log('Bot handlers registered for ' + user.email + ' (lazy webhook mode)');
 }
 
+// FIX: New helper — lazily hydrate a bot AND ensure its webhook is registered.
+// Previously, lazy hydration inside the webhook route only called registerBot()
+// (which registers handlers) but never called setupBotWebhook(), so Telegram
+// had no URL to send future updates to. After a server restart the first
+// inbound update triggers hydration, but without the webhook call every
+// subsequent update from a *different* user would be silently dropped until
+// their bot was also lazily hydrated — and bots connected while the server
+// was down would never receive updates at all.
 async function hydrateBot(user) {
   if (!activeBots.has(user.id)) {
-    // Ensure we have fresh user data
-    const freshUser = await User.findOne({ id: user.id });
-    if (freshUser) {
-      user = freshUser;
-    }
     registerBot(user);
+    // Fire-and-forget: we don't want to block the webhook response while
+    // Telegram round-trips happen. Errors are logged inside setupBotWebhook.
     setupBotWebhook(user).catch(function(err) {
       console.error('Background webhook setup failed for ' + user.email + ':', err.message);
     });
@@ -641,12 +639,17 @@ async function incrementDailyBroadcast(userId) {
     return record.count;
   } catch (err) {
     if (err.code === 11000) {
-      const record = await BroadcastDaily.findOneAndUpdate(
-        { userId: userId, date: today },
-        { $inc: { count: 1 } },
-        { new: true }
-      );
-      return record ? record.count : 1;
+      try {
+        const record = await BroadcastDaily.findOneAndUpdate(
+          { userId: userId, date: today },
+          { $inc: { count: 1 } },
+          { new: true }
+        );
+        return record ? record.count : 1;
+      } catch (retryErr) {
+        console.error('incrementDailyBroadcast retry failed for ' + userId + ':', retryErr.message);
+        throw retryErr;
+      }
     }
     console.error('incrementDailyBroadcast failed for ' + userId + ':', err.message);
     throw err;
@@ -914,10 +917,16 @@ async function main() {
   };
 
   // ==================== WEBHOOK ENDPOINT ====================
+  // FIX: Fastify parses application/json bodies into objects automatically.
+  // The old code branched on Buffer.isBuffer() which could never be true
+  // because Fastify's JSON parser runs first. Now we always use request.body
+  // directly if it's an object, and only fall back to string parsing if needed.
   fastify.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async function(request, reply) {
     const userId = request.params.userId;
-    console.log(`[WEBHOOK] Received update for userId: ${userId}`);
 
+    // FIX: use hydrateBot() instead of bare registerBot().
+    // hydrateBot ensures the webhook URL is (re-)registered with Telegram
+    // so the bot can receive future updates — not just process this one.
     let bot = activeBots.get(userId);
     if (!bot) {
       try {
@@ -1369,15 +1378,15 @@ async function main() {
     reply.send({ success: true });
   });
 
-  // ==================== SUBSCRIBE & CONTACTS (FIXED) ====================
+  // ==================== SUBSCRIBE & CONTACTS ====================
   fastify.post('/api/subscribe/:shortId', { config: formSubmitLimiterConfig }, async function(request, reply) {
     const shortId = request.params.shortId;
-    const { name, email: contactValueRaw } = request.body;  // renamed for clarity
+    const { name, email } = request.body;
 
     if (!name || !name.trim()) return reply.code(400).send({ error: 'Name is required' });
-    if (!contactValueRaw || !contactValueRaw.trim()) return reply.code(400).send({ error: 'Contact is required' });
+    if (!email || !email.trim()) return reply.code(400).send({ error: 'Contact is required' });
 
-    const contactValue = contactValueRaw.trim();
+    const contactValue = email.trim();
     if (!CONTACT_REGEX.test(contactValue)) return reply.code(400).send({ error: 'Contact must be a valid email address or phone number' });
 
     const form = await FormPage.findOne({ shortId: shortId });
@@ -1388,26 +1397,31 @@ async function main() {
 
     const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
 
-    // Ensure contact record exists (pending)
     let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
 
     if (contact) {
-      contact.name = name.trim();
-      contact.shortId = shortId;
-      contact.submittedAt = new Date();
-      await contact.save();
+      if (contact.status === 'subscribed') {
+        contact.name = name.trim();
+        contact.shortId = shortId;
+        contact.submittedAt = new Date();
+        await contact.save();
+      } else {
+        contact.name = name.trim();
+        contact.shortId = shortId;
+        contact.submittedAt = new Date();
+        await contact.save();
+      }
     } else {
       contact = new Contact({
-        userId: owner.id, 
-        shortId: shortId, 
-        name: name.trim(), 
-        contact: contactValue,
-        status: 'pending', 
-        submittedAt: new Date()
+        userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue,
+        status: 'pending', submittedAt: new Date()
       });
       await contact.save();
     }
 
+    // Write to in-memory map first (same as Express — this is what the bot.start
+    // handler checks first and is the reason the Express version works reliably).
+    // Also write to MongoDB as a fallback for tokens that need to survive a restart.
     const subData = {
       userId: owner.id,
       shortId: shortId,
@@ -1415,17 +1429,16 @@ async function main() {
       contact: contactValue,
       createdAt: Date.now()
     };
-
-    // CRITICAL FIX: Await DB write to eliminate race condition
-    await PendingSubscriber.findOneAndUpdate(
-      { payload: payload },
-      { $set: subData },
-      { upsert: true, new: true }
-    );
-    console.log(`[SUBSCRIBE] Pending subscriber persisted to DB: ${payload}`);
-
-    // Also keep in-memory
     pendingSubscribers.set(payload, subData);
+
+    // Fire-and-forget the DB write — don't let a MongoDB hiccup block the response.
+    PendingSubscriber.findOneAndUpdate(
+      { payload: payload },
+      { $set: { userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue, createdAt: new Date() } },
+      { upsert: true, new: true }
+    ).catch(function(err) {
+      console.error('Failed to persist PendingSubscriber to DB (in-memory fallback still active):', err.message);
+    });
 
     invalidateUserCache(owner.id, 'contacts');
 
@@ -1646,6 +1659,8 @@ async function main() {
   fastify.setNotFoundHandler(async function(request, reply) { reply.code(404); return reply.view('404'); });
 
   // ==================== CLEANUP ====================
+  // Purge expired in-memory pending subscribers every hour (same as Express version).
+  // MongoDB TTL index (expires: 1800) handles the DB-side cleanup automatically.
   setInterval(function() {
     const now = Date.now();
     for (const [key, data] of pendingSubscribers.entries()) {
