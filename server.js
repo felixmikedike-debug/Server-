@@ -16,7 +16,7 @@ const { Queue, Worker } = require('bullmq');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.set('trust proxy', 3);
+('trust proxy', 3);
 
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
@@ -72,13 +72,7 @@ if (process.env.REDIS_URL) {
   });
 }
 
-const broadcastQueue = new Queue('telegram-broadcasts', { 
-  connection: redisConnection,
-  defaultJobOptions: {
-    removeOnComplete: true,
-    removeOnFail: { count: 50 }
-  }
-});
+const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
 
 // ==================== CONTACT VALIDATION REGEX ====================
 const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
@@ -296,6 +290,7 @@ const lastWebhookSetTime = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
 function launchUserBot(user) {
+  // Remove old bot instance without calling .stop() (not needed in pure webhook mode)
   if (activeBots.has(user.id)) {
     activeBots.delete(user.id);
     console.log('Removed old bot instance for user ' + user.email + ' without stopping (webhook mode)');
@@ -435,7 +430,7 @@ function launchUserBot(user) {
       await new Promise(resolve => setTimeout(resolve, 2500));
 
       let attempts = 0;
-      const maxAttempts = 5;
+      const maxAttempts = 5; // Increased attempts for network reliability
 
       while (attempts < maxAttempts) {
         try {
@@ -460,7 +455,7 @@ function launchUserBot(user) {
             if (attempts >= maxAttempts) {
               throw err;
             }
-            await new Promise(r => setTimeout(r, 5000));
+            await new Promise(r => setTimeout(r, 5000)); // Extra delay on failure
           }
         }
       }
@@ -469,6 +464,7 @@ function launchUserBot(user) {
     } catch (err) {
       console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
     } finally {
+      // Always register the bot instance even if webhook failed (it can still handle incoming updates)
       activeBots.set(user.id, bot);
     }
   })();
@@ -574,6 +570,7 @@ function escapeHtml(unsafe) {
 
 function textToHtmlForDisplay(text) {
   if (!text) return '';
+  
   return text
     .replace(/\n{2,}/g, '</p><p>')
     .replace(/\n/g, '<br>');
@@ -583,6 +580,7 @@ function prepareTelegramMessage(raw) {
   if (!raw || typeof raw !== 'string') return '';
 
   let msg = raw.trim();
+
   msg = msg
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n')
@@ -659,17 +657,10 @@ async function incrementDailyBroadcast(userId) {
 
 // ==================== BullMQ Worker ====================
 async function processBroadcast(job) {
-  console.log(`[Broadcast Worker] Starting job ${job.id} for user ${job.data.userId}`);
-
   const { userId, message, broadcastId } = job.data;
-
-  if (!message || typeof message !== 'string') {
-    throw new Error('Invalid message in broadcast job');
-  }
 
   const bot = activeBots.get(userId);
   if (!bot) {
-    console.error(`[Broadcast Worker] Bot not found for user ${userId}`);
     throw new Error('Telegram bot not connected');
   }
 
@@ -679,13 +670,11 @@ async function processBroadcast(job) {
     userId: userId,
     status: 'subscribed',
     telegramChatId: { $exists: true, $ne: null }
-  }).lean();
+  });
 
   const total = targets.length;
   let sent = 0;
   let failed = 0;
-
-  console.log(`[Broadcast Worker] Found ${total} targets for user ${userId}`);
 
   const batches = [];
   for (let i = 0; i < targets.length; i += BATCH_SIZE) {
@@ -694,30 +683,23 @@ async function processBroadcast(job) {
 
   for (let b = 0; b < batches.length; b++) {
     const batch = batches[b];
-    console.log(`[Broadcast Worker] Processing batch \( {b + 1}/ \){batches.length} for user ${userId}`);
 
     const sendPromises = batch.map(async function(target) {
       try {
         for (const chunk of chunks) {
-          await bot.telegram.sendMessage(target.telegramChatId, chunk, { 
-            parse_mode: 'HTML',
-            disable_web_page_preview: true 
-          });
+          await bot.telegram.sendMessage(target.telegramChatId, chunk, { parse_mode: 'HTML' });
         }
         sent++;
       } catch (err) {
         failed++;
-        console.error(`[Broadcast Worker] Failed to send to ${target.telegramChatId}:`, err.message);
-        
         const isBlocked = err.response?.error_code === 403 ||
-          /blocked|forbidden|chat not found|deactivated|user is deactivated/i.test(err.message || '');
-        
+          /blocked|forbidden|chat not found|deactivated/i.test(err.message || '');
         if (isBlocked) {
           await Contact.findByIdAndUpdate(target._id, {
             status: 'unsubscribed',
             unsubscribedAt: new Date(),
             telegramChatId: null
-          }).catch(() => {});
+          });
         }
       }
     });
@@ -725,14 +707,12 @@ async function processBroadcast(job) {
     await Promise.all(sendPromises);
 
     if (b < batches.length - 1) {
-      console.log(`[Broadcast Worker] Waiting ${BATCH_INTERVAL_MS}ms before next batch`);
       await new Promise(resolve => setTimeout(resolve, BATCH_INTERVAL_MS));
     }
   }
 
   const user = await User.findOne({ id: userId });
   let reportText = broadcastId ? '<b>Scheduled Broadcast Report</b>\n\n' : '<b>Broadcast Report</b>\n\n';
-  
   if (total === 0) {
     reportText += 'No subscribed contacts with Telegram connected.';
   } else {
@@ -745,53 +725,42 @@ async function processBroadcast(job) {
   if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
     try {
       await bot.telegram.sendMessage(user.telegramChatId, reportText, { parse_mode: 'HTML' });
-      console.log(`[Broadcast Worker] Report sent to user ${userId}`);
     } catch (err) {
       console.error('Failed to send report to user ' + userId, err);
     }
   }
 
   if (broadcastId) {
-    await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId }).catch(() => {});
+    await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId });
   }
 
   invalidateUserCache(userId, 'contacts');
-  console.log(`[Broadcast Worker] Job ${job.id} completed successfully for user ${userId}`);
 }
 
 const worker = new Worker('telegram-broadcasts', processBroadcast, {
   connection: redisConnection,
-  concurrency: 3,
-  limiter: {
-    max: 1,
-    duration: 1000
-  }
+  concurrency: 4
 });
 
 worker.on('completed', function(job) {
-  console.log(`[Worker] Broadcast job ${job.id} completed for user ${job.data.userId}`);
+  console.log('Broadcast job (' + (job.id || 'immediate') + ') completed for user ' + job.data.userId);
 });
 
 worker.on('failed', async function(job, err) {
-  console.error(`[Worker] Broadcast job ${job?.id || 'unknown'} failed:`, err.message);
-  
-  const { userId, broadcastId } = job?.data || {};
-  
+  console.error('Broadcast job (' + (job.id || 'immediate') + ') failed permanently: ' + err.message);
+  const { userId, broadcastId } = job.data || {};
   if (broadcastId) {
-    await ScheduledBroadcast.findOneAndUpdate({ broadcastId: broadcastId }, { status: 'failed' }).catch(() => {});
+    await ScheduledBroadcast.findOneAndUpdate({ broadcastId: broadcastId }, { status: 'failed' }).catch(function() {});
   }
-
-  if (userId) {
-    const user = await User.findOne({ id: userId });
-    if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
-      const bot = activeBots.get(userId);
-      const text = broadcastId 
-        ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message
-        : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
-      try {
-        await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
-      } catch (e) {}
-    }
+  const user = await User.findOne({ id: userId });
+  if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
+    const bot = activeBots.get(userId);
+    const text = broadcastId 
+      ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message
+      : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
+    try {
+      await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
+    } catch {}
   }
 });
 
@@ -827,7 +796,7 @@ async function recoverLostScheduledBroadcasts() {
 
     const delayMs = task.scheduledTime.getTime() - Date.now();
 
-    try {
+    if (delayMs <= 1000) {
       await broadcastQueue.add(
         'send-broadcast',
         {
@@ -837,18 +806,28 @@ async function recoverLostScheduledBroadcasts() {
         },
         {
           jobId: task.broadcastId,
-          delay: delayMs > 0 ? delayMs : 0,
-          attempts: 5,
-          backoff: { 
-            type: 'exponential', 
-            delay: 10000 
-          }
+          attempts: 4,
+          backoff: { type: 'exponential', delay: 5000 }
         }
       );
-      recovered++;
-    } catch (e) {
-      console.error('Failed to re-queue broadcast', task.broadcastId, e);
+    } else {
+      await broadcastQueue.add(
+        'send-broadcast',
+        {
+          userId: task.userId,
+          message: task.message,
+          broadcastId: task.broadcastId
+        },
+        {
+          jobId: task.broadcastId,
+          delay: delayMs,
+          attempts: 4,
+          backoff: { type: 'exponential', delay: 5000 }
+        }
+      );
     }
+
+    recovered++;
   }
 
   console.log(
@@ -938,14 +917,15 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
     return res.status(400).json({ error: 'This bot is already linked to another account.' });
   }
 
+  // Retry validation for network issues
   let botInfo;
   let attempts = 0;
-  const maxAttempts = 7;
+  const maxAttempts = 7; // Increased retries
   while (attempts < maxAttempts) {
     attempts++;
     try {
       const response = await axios.get('https://api.telegram.org/bot' + token + '/getMe', {
-        timeout: 20000
+        timeout: 20000 // Increased timeout
       });
       if (!response.data.ok) {
         return res.status(400).json({ 
@@ -962,19 +942,21 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
       if (attempts >= maxAttempts) {
         return res.status(500).json({ error: 'Network error validating bot token. Please try again later.' });
       }
-      await new Promise(r => setTimeout(r, 8000));
+      await new Promise(r => setTimeout(r, 8000)); // Longer backoff
     }
   }
 
   const botUsername = botInfo.username.replace(/^@/, '');
 
+  // Clear old webhook if token is different
   if (req.user.telegramBotToken && req.user.telegramBotToken !== token) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
         drop_pending_updates: true
       }, { timeout: 20000 });
+      console.log('Old webhook cleared before connecting new bot for user ' + req.user.id);
     } catch (err) {
-      console.warn('Failed to clear old webhook: ' + err.message);
+      console.warn('Failed to clear old webhook (may be invalid token): ' + err.message);
     }
   }
 
@@ -1007,6 +989,7 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
     return res.status(400).json({ error: 'This bot is already linked to another account.' });
   }
 
+  // Retry validation for network issues
   let botInfo;
   let attempts = 0;
   const maxAttempts = 7;
@@ -1037,11 +1020,13 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
 
   const botUsername = botInfo.username.replace(/^@/, '');
 
+  // Always clear old webhook on token change
   if (req.user.telegramBotToken) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
         drop_pending_updates: true
       }, { timeout: 20000 });
+      console.log('Old webhook cleared on bot token change for user ' + req.user.id);
     } catch (err) {
       console.warn('Failed to clear old webhook on token change: ' + err.message);
     }
@@ -1066,16 +1051,19 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
 });
 
 app.post('/api/auth/disconnect-telegram', authenticateToken, async function(req, res) {
+  // Clear webhook via direct API
   if (req.user.telegramBotToken) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
         drop_pending_updates: true
       }, { timeout: 20000 });
+      console.log('Webhook cleared on disconnect for user ' + req.user.id);
     } catch (err) {
       console.warn('Failed to clear webhook on disconnect: ' + err.message);
     }
   }
 
+  // Remove bot instance without .stop()
   if (activeBots.has(req.user.id)) {
     activeBots.delete(req.user.id);
   }
@@ -1630,14 +1618,10 @@ app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
   res.json({ success: true, deletedCount: result.deletedCount });
 });
 
-// ==================== BROADCAST ENDPOINTS (FIXED) ====================
+// ==================== BROADCASTING ====================
 app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
-  console.log(`[Broadcast Now] Request from user ${req.user.id}`);
-
   const { message } = req.body;
-  if (!message || !message.trim()) {
-    return res.status(400).json({ error: 'Message required' });
-  }
+  if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
   const processed = message.trim();
   if (processed.length > MAX_MSG_LENGTH * 10) {
@@ -1646,46 +1630,33 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
 
   const todayCount = await incrementDailyBroadcast(req.user.id);
   const limits = getUserLimits(req.user);
-  
   if (todayCount > limits.dailyBroadcasts && limits.dailyBroadcasts !== Infinity) {
     return res.status(403).json({ error: 'Daily broadcast limit reached.' });
   }
 
   const readyMessage = prepareTelegramMessage(processed);
+
   if (readyMessage.length === 0) {
     return res.status(400).json({ error: 'Message empty after processing' });
   }
 
-  try {
-    const job = await broadcastQueue.add('send-broadcast', {
-      userId: req.user.id,
-      message: readyMessage
-    }, {
-      attempts: 5,
-      backoff: { type: 'exponential', delay: 8000 },
-      removeOnComplete: true
-    });
+  await broadcastQueue.add('send-broadcast', {
+    userId: req.user.id,
+    message: readyMessage
+  }, {
+    attempts: 4,
+    backoff: { type: 'exponential', delay: 5000 }
+  });
 
-    console.log(`[Broadcast Now] Job ${job.id} queued for user ${req.user.id}`);
-
-    res.json({ 
-      success: true, 
-      jobId: job.id,
-      message: 'Broadcast queued. Delivery report will be sent via Telegram.' 
-    });
-  } catch (err) {
-    console.error('[Broadcast Now] Queue error:', err);
-    res.status(500).json({ error: 'Failed to queue broadcast' });
-  }
+  res.json({ 
+    success: true, 
+    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.' 
+  });
 });
 
 app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) {
-  console.log(`[Broadcast Schedule] Request from user ${req.user.id}`);
-
   const { message, scheduledTime, recipients = 'all' } = req.body;
-  if (!message || !message.trim()) {
-    return res.status(400).json({ error: 'Message required' });
-  }
+  if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
   const processed = message.trim();
   if (processed.length > MAX_MSG_LENGTH * 10) {
@@ -1703,18 +1674,6 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     return res.status(400).json({ error: 'Invalid future time' });
   }
 
-  // Prevent 2 broadcasts in same minute
-  const minuteStart = new Date(time.getFullYear(), time.getMonth(), time.getDate(), time.getHours(), time.getMinutes());
-  const existingInMinute = await ScheduledBroadcast.countDocuments({
-    userId: req.user.id,
-    scheduledTime: { $gte: minuteStart, $lt: new Date(minuteStart.getTime() + 60000) },
-    status: 'pending'
-  });
-
-  if (existingInMinute > 0) {
-    return res.status(409).json({ error: 'You already have a broadcast scheduled in this minute. Choose a different time.' });
-  }
-
   const readyMessage = prepareTelegramMessage(processed);
   const broadcastId = uuidv4();
 
@@ -1729,30 +1688,18 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
 
   const delay = time.getTime() - Date.now();
 
-  try {
-    await broadcastQueue.add('send-broadcast', {
-      userId: req.user.id,
-      message: readyMessage,
-      broadcastId: broadcastId
-    }, {
-      jobId: broadcastId,
-      delay: delay > 0 ? delay : 0,
-      attempts: 5,
-      backoff: { type: 'exponential', delay: 8000 }
-    });
+  await broadcastQueue.add('send-broadcast', {
+    userId: req.user.id,
+    message: readyMessage,
+    broadcastId: broadcastId
+  }, {
+    jobId: broadcastId,
+    delay: delay,
+    attempts: 4,
+    backoff: { type: 'exponential', delay: 5000 }
+  });
 
-    console.log(`[Broadcast Schedule] Scheduled ${broadcastId} for ${time}`);
-
-    res.json({ 
-      success: true, 
-      broadcastId: broadcastId, 
-      scheduledTime: time.toISOString() 
-    });
-  } catch (err) {
-    console.error('[Broadcast Schedule] Queue error:', err);
-    await ScheduledBroadcast.deleteOne({ broadcastId });
-    res.status(500).json({ error: 'Failed to schedule broadcast' });
-  }
+  res.json({ success: true, broadcastId: broadcastId, scheduledTime: time.toISOString() });
 });
 
 app.get('/api/broadcast/scheduled', authenticateToken, async function(req, res) {
@@ -1775,9 +1722,12 @@ app.delete('/api/broadcast/scheduled/:broadcastId', authenticateToken, async fun
   if (!task) return res.status(404).json({ error: 'Not found' });
 
   const job = await broadcastQueue.getJob(broadcastId);
-  if (job) await job.remove();
+  if (job) {
+    await job.remove();
+  }
 
   await task.deleteOne();
+
   res.json({ success: true });
 });
 
@@ -1788,14 +1738,19 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
   if (!task) return res.status(400).json({ error: 'Cannot edit this broadcast' });
 
   const oldJob = await broadcastQueue.getJob(task.broadcastId);
-  if (oldJob) await oldJob.remove();
+  if (oldJob) {
+    await oldJob.remove();
+  }
 
   let needsUpdate = false;
 
   if (message && message.trim()) {
     const processed = message.trim();
-    if (processed.length > MAX_MSG_LENGTH * 10) return res.status(400).json({ error: 'Message too long' });
-    task.message = prepareTelegramMessage(processed);
+    if (processed.length > MAX_MSG_LENGTH * 10) {
+      return res.status(400).json({ error: 'Message too long' });
+    }
+    const readyMessage = prepareTelegramMessage(processed);
+    task.message = readyMessage;
     needsUpdate = true;
   }
   if (recipients) {
@@ -1805,24 +1760,15 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
   if (scheduledTime) {
     const newTime = new Date(scheduledTime);
     if (isNaN(newTime.getTime()) || newTime <= new Date()) return res.status(400).json({ error: 'Invalid future time' });
-
-    const minuteStart = new Date(newTime.getFullYear(), newTime.getMonth(), newTime.getDate(), newTime.getHours(), newTime.getMinutes());
-    const existing = await ScheduledBroadcast.countDocuments({
-      userId: req.user.id,
-      scheduledTime: { $gte: minuteStart, $lt: new Date(minuteStart.getTime() + 60000) },
-      broadcastId: { $ne: task.broadcastId },
-      status: 'pending'
-    });
-
-    if (existing > 0) return res.status(409).json({ error: 'Another broadcast already scheduled in this minute.' });
-
     task.scheduledTime = newTime;
     needsUpdate = true;
   }
 
   if (needsUpdate) {
     await task.save();
+
     const delay = task.scheduledTime.getTime() - Date.now();
+
     await broadcastQueue.add('send-broadcast', {
       userId: task.userId,
       message: task.message,
@@ -1830,8 +1776,8 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
     }, {
       jobId: task.broadcastId,
       delay: delay > 0 ? delay : 0,
-      attempts: 5,
-      backoff: { type: 'exponential', delay: 8000 }
+      attempts: 4,
+      backoff: { type: 'exponential', delay: 5000 }
     });
   }
 
@@ -1840,6 +1786,7 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
 
 app.get('/api/broadcast/scheduled/:broadcastId/details', authenticateToken, async function(req, res) {
   const task = await ScheduledBroadcast.findOne({ broadcastId: req.params.broadcastId, userId: req.user.id });
+
   if (!task || task.status !== 'pending') {
     return res.status(404).json({ error: 'Broadcast not found or not editable' });
   }
@@ -1862,52 +1809,58 @@ app.get('/admin-limits', async function(req, res) {
   const totalUsers = await User.countDocuments({});
   const payingUsers = await User.countDocuments({ isSubscribed: true, subscriptionEndDate: { $gt: new Date() } });
 
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Server Admin Panel</title>
-  <style>
-    body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-    .container { background: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); width: 90%; max-width: 600px; }
-    h1 { text-align: center; color: #ffd700; margin-bottom: 30px; }
-    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 30px; }
-    .stat-box { background: #2d2d2d; padding: 20px; border-radius: 10px; text-align: center; }
-    .stat-number { font-size: 2.5em; font-weight: bold; color: #00ff41; margin: 10px 0; }
-    .stat-label { font-size: 1.1em; color: #aaa; }
-    label { display: block; margin: 20px 0 8px; font-size: 1.1em; }
-    input[type="number"], input[type="password"] { width: 100%; padding: 12px; background: #2d2d2d; border: none; border-radius: 6px; color: white; font-size: 1em; margin-bottom: 15px; }
-    button { width: 100%; padding: 14px; background: #ffd700; color: black; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; margin-top: 20px; }
-    button:hover { background: #e6c200; }
-    .current { text-align: center; margin: 25px 0; padding: 15px; background: #2d2d2d; border-radius: 8px; font-size: 1.1em; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Server Admin Panel</h1>
-    <div class="stats">
-      <div class="stat-box"><div class="stat-number">${totalUsers}</div><div class="stat-label">Total Users</div></div>
-      <div class="stat-box"><div class="stat-number">${payingUsers}</div><div class="stat-label">Paying Users</div></div>
-    </div>
-    <form method="POST">
-      <label>Owner Password</label>
-      <input type="password" name="password" required placeholder="Enter admin password">
-      <label>Daily Broadcasts per User (Free)</label>
-      <input type="number" name="daily_broadcast" min="1" value="${adminSettingsCache.dailyBroadcastLimit}" required>
-      <label>Max Landing Pages per User (Free)</label>
-      <input type="number" name="max_pages" min="1" value="${adminSettingsCache.maxLandingPages}" required>
-      <label>Max Forms per User (Free)</label>
-      <input type="number" name="max_forms" min="1" value="${adminSettingsCache.maxForms}" required>
-      <div class="current">
-        <strong>Current Free Tier Limits:</strong><br>
-        Broadcasts/day: ${adminSettingsCache.dailyBroadcastLimit} | Pages: ${adminSettingsCache.maxLandingPages} | Forms: ${adminSettingsCache.maxForms}
-      </div>
-      <button type="submit">Update Limits</button>
-    </form>
-  </div>
-</body>
-</html>`;
+  const html = '<!DOCTYPE html>\n' +
+    '<html lang="en">\n' +
+    '<head>\n' +
+    '  <meta charset="UTF-8">\n' +
+    '  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
+    '  <title>Server Admin Panel</title>\n' +
+    '  <style>\n' +
+    '    body { font-family: \'Segoe UI\', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }\n' +
+    '    .container { background: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); width: 90%; max-width: 600px; }\n' +
+    '    h1 { text-align: center; color: #ffd700; margin-bottom: 30px; }\n' +
+    '    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 30px; }\n' +
+    '    .stat-box { background: #2d2d2d; padding: 20px; border-radius: 10px; text-align: center; }\n' +
+    '    .stat-number { font-size: 2.5em; font-weight: bold; color: #00ff41; margin: 10px 0; }\n' +
+    '    .stat-label { font-size: 1.1em; color: #aaa; }\n' +
+    '    label { display: block; margin: 20px 0 8px; font-size: 1.1em; }\n' +
+    '    input[type="number"], input[type="password"] { width: 100%; padding: 12px; background: #2d2d2d; border: none; border-radius: 6px; color: white; font-size: 1em; margin-bottom: 15px; }\n' +
+    '    button { width: 100%; padding: 14px; background: #ffd700; color: black; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; margin-top: 20px; }\n' +
+    '    button:hover { background: #e6c200; }\n' +
+    '    .current { text-align: center; margin: 25px 0; padding: 15px; background: #2d2d2d; border-radius: 8px; font-size: 1.1em; }\n' +
+    '  </style>\n' +
+    '</head>\n' +
+    '<body>\n' +
+    '  <div class="container">\n' +
+    '    <h1>Server Admin Panel</h1>\n' +
+    '    <div class="stats">\n' +
+    '      <div class="stat-box">\n' +
+    '        <div class="stat-number">' + totalUsers + '</div>\n' +
+    '        <div class="stat-label">Total Users</div>\n' +
+    '      </div>\n' +
+    '      <div class="stat-box">\n' +
+    '        <div class="stat-number">' + payingUsers + '</div>\n' +
+    '        <div class="stat-label">Paying Users</div>\n' +
+    '      </div>\n' +
+    '    </div>\n' +
+    '    <form method="POST">\n' +
+    '      <label>Owner Password</label>\n' +
+    '      <input type="password" name="password" required placeholder="Enter admin password">\n' +
+    '      <label>Daily Broadcasts per User (Free)</label>\n' +
+    '      <input type="number" name="daily_broadcast" min="1" value="' + adminSettingsCache.dailyBroadcastLimit + '" required>\n' +
+    '      <label>Max Landing Pages per User (Free)</label>\n' +
+    '      <input type="number" name="max_pages" min="1" value="' + adminSettingsCache.maxLandingPages + '" required>\n' +
+    '      <label>Max Forms per User (Free)</label>\n' +
+    '      <input type="number" name="max_forms" min="1" value="' + adminSettingsCache.maxForms + '" required>\n' +
+    '      <div class="current">\n' +
+    '        <strong>Current Free Tier Limits:</strong><br>\n' +
+    '        Broadcasts/day: ' + adminSettingsCache.dailyBroadcastLimit + ' | Pages: ' + adminSettingsCache.maxLandingPages + ' | Forms: ' + adminSettingsCache.maxForms + '\n' +
+    '      </div>\n' +
+    '      <button type="submit">Update Limits</button>\n' +
+    '    </form>\n' +
+    '  </div>\n' +
+    '</body>\n' +
+    '</html>';
   res.send(html);
 });
 
@@ -1939,16 +1892,33 @@ app.post('/admin-limits', async function(req, res) {
       maxForms: newForms
     };
 
-    console.log('Admin limits updated:', adminSettingsCache);
+    console.log('Admin limits updated and saved to DB:', adminSettingsCache);
 
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>Limits Updated</title>
-<style>body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-.container { background: #1e1e1e; padding: 40px; border-radius: 12px; text-align: center; } h1 { color: #4caf50; }</style>
-</head>
-<body><div class="container"><h1>Success!</h1><p>Limits updated and saved permanently.</p>
-<p><a href="/admin-limits">← Back</a></p></div></body></html>`);
+    res.send('<!DOCTYPE html>\n' +
+      '<html lang="en">\n' +
+      '<head>\n' +
+      '  <meta charset="UTF-8">\n' +
+      '  <title>Limits Updated</title>\n' +
+      '  <style>\n' +
+      '    body { font-family: \'Segoe UI\', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }\n' +
+      '    .container { background: #1e1e1e; padding: 40px; border-radius: 12px; text-align: center; }\n' +
+      '    h1 { color: #4caf50; }\n' +
+      '    .success { font-size: 1.2em; margin: 20px 0; }\n' +
+      '    a { color: #ffd700; text-decoration: none; font-weight: bold; }\n' +
+      '    a:hover { text-decoration: underline; }\n' +
+      '  </style>\n' +
+      '</head>\n' +
+      '<body>\n' +
+      '  <div class="container">\n' +
+      '    <h1>Success!</h1>\n' +
+      '    <p class="success">Server limits updated and <strong>saved permanently</strong>:</p>\n' +
+      '    <p><strong>Daily Broadcasts:</strong> ' + newDaily + '<br>\n' +
+      '       <strong>Max Pages:</strong> ' + newPages + '<br>\n' +
+      '       <strong>Max Forms:</strong> ' + newForms + '</p>\n' +
+      '    <p><a href="/admin-limits">← Back to Control Panel</a></p>\n' +
+      '  </div>\n' +
+      '</body>\n' +
+      '</html>');
   } catch (err) {
     console.error('Failed to save admin settings:', err);
     res.status(500).send('Failed to save settings');
@@ -2019,6 +1989,7 @@ app.use(function(req, res) {
 });
 
 app.listen(PORT, function() {
-  console.log('\n✅ SENDEM SERVER STARTED SUCCESSFULLY');
-  console.log('Port: ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
+  console.log('\nSENDEM SERVER — FULL VERSION WITH BullMQ + Redis BROADCAST QUEUE');
+  console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
+  
