@@ -369,7 +369,6 @@ function launchUserBot(user) {
     const payload = ctx.startPayload || '';
     const chatId  = ctx.chat.id.toString();
 
-    // Subscriber flow
     if (payload.startsWith('sub_') && pendingSubscribers.has(payload)) {
       const sub = pendingSubscribers.get(payload);
       if (sub.userId === user.id) {
@@ -397,7 +396,6 @@ function launchUserBot(user) {
         }
         await target.save();
 
-        // Remove duplicates
         await Contact.deleteMany({
           userId: user.id,
           $or: [
@@ -421,7 +419,6 @@ function launchUserBot(user) {
       }
     }
 
-    // 2FA owner connect
     if (payload === user.id) {
       const freshUser = await User.findOne({ id: user.id });
       if (freshUser) {
@@ -449,7 +446,6 @@ function launchUserBot(user) {
   const webhookPath = `/webhook/\( {WEBHOOK_SECRET}/ \){user.id}`;
   const webhookUrl  = `https://\( {DOMAIN} \){webhookPath}`;
 
-  // SYNCHRONOUS-STYLE WEBHOOK SETUP WITH IMPROVED RETRIES
   (async () => {
     try {
       console.log(`[Webhook Setup] Starting for \( {user.email} (@ \){user.botUsername || 'unknown'})`);
@@ -459,7 +455,7 @@ function launchUserBot(user) {
       const recentlySet = (Date.now() - (lastWebhookSetTime.get(user.id) || 0)) < 30*60*1000;
 
       if (alreadyOk && recentlySet) {
-        console.log(`[Webhook Setup] Already OK for ${user.email}, skipping.`);
+        console.log(`[Webhook Setup] Already OK for ${user.email}`);
         return;
       }
 
@@ -475,7 +471,7 @@ function launchUserBot(user) {
             console.log(`✅ Webhook successfully set for ${user.email} → ${webhookUrl}`);
             lastWebhookSetTime.set(user.id, Date.now());
 
-            if (user.telegramChatId && activeBots.has(user.id)) {
+            if (user.telegramChatId) {
               await bot.telegram.sendMessage(user.telegramChatId,
                 '✅ <b>Bot connected successfully!</b>\nDeep links and subscriptions should now work.',
                 { parse_mode: 'HTML' }
@@ -486,7 +482,7 @@ function launchUserBot(user) {
         } catch (err) {
           if (err.response?.error_code === 429) {
             const wait = (err.response.parameters?.retry_after || 30) + 5;
-            console.warn(`[Webhook Setup] Rate-limited for ${user.email}, waiting ${wait}s (attempt ${attempt+1}/6)`);
+            console.warn(`[Webhook Setup] Rate-limited for ${user.email}, waiting ${wait}s`);
             await sleep(wait * 1000);
           } else {
             console.error(`[Webhook Setup] Failed for ${user.email}: ${err.message}`);
@@ -711,7 +707,7 @@ app.post('/api/auth/connect-telegram', { preHandler: app.authenticate }, async (
 
   launchUserBot(req.user.toObject ? req.user.toObject() : { ...req.user });
 
-  await sleep(2500); // Give webhook time to settle
+  await sleep(2500);
 
   reply.send({ success: true, message: 'Bot connected!', botUsername: '@' + botUsername, startLink: `https://t.me/\( {botUsername}?start= \){req.user.id}` });
 });
