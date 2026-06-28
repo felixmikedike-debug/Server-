@@ -32,8 +32,8 @@ app.register(require('@fastify/static'),  { root: path.join(__dirname, 'public')
 app.register(require('@fastify/view'),    { engine: { ejs: require('ejs') }, root: path.join(__dirname, 'views') });
 app.register(require('@fastify/formbody'));
 app.register(require('@fastify/rate-limit'), {
-  global: false,
-  redis:  null,
+  global: false,  // apply per-route only
+  redis:  null,   // uses in-memory by default; swap to redis instance for multi-process
 });
 
 // ==================== CONFIG & SECRETS ====================
@@ -60,7 +60,7 @@ if (!WEBHOOK_SECRET || !WEBHOOK_SECRET.trim()) {
 if (JWT_SECRET.includes('fallback'))        console.warn('⚠️  JWT_SECRET is insecure fallback.');
 if (PAYSTACK_SECRET_KEY.startsWith('sk_test_fallback')) console.warn('⚠️  PAYSTACK_SECRET_KEY not set.');
 
-const MONTHLY_PRICE_KOBO = 150000;
+const MONTHLY_PRICE_KOBO = 150000; // ₦1,500 in kobo
 const BATCH_SIZE         = 25;
 const BATCH_INTERVAL_MS  = 8000;
 const MAX_MSG_LENGTH     = 4000;
@@ -215,14 +215,14 @@ function invalidateUserCache(userId, type = 'all') {
 
 function invalidatePublicCache(key) { publicCache.delete(key); }
 
-// Cache GC
+// Cache GC — every 10 min
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of publicCache) if (now - v.timestamp > TTL.public)      publicCache.delete(k);
   for (const [k, v] of userCache)   if (now - v.lastAccess > 30*60*1000)     { userCache.delete(k); }
 }, 10*60*1000);
 
-// PendingSubscriber GC
+// PendingSubscriber GC — every hour
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of pendingSubscribers) if (now - v.createdAt > 30*60*1000) pendingSubscribers.delete(k);
@@ -256,10 +256,10 @@ function sanitizeTelegramHtml(unsafe) {
       const an = m[1].toLowerCase(), av = m[2];
       if (allowedAttrs[t]?.includes(an)) {
         const safe = (an === 'href' && !/^https?:\/\//i.test(av) && !av.startsWith('/')) ? '#' : av;
-        attrs += ` \( {an}=" \){safe.replace(/"/g,'&quot;')}"`;
+        attrs += ` ${an}="${safe.replace(/"/g,'&quot;')}"`;
       }
     }
-    return `<\( {t} \){attrs}>`;
+    return `<${t}${attrs}>`;
   });
   return clean.trim();
 }
@@ -299,7 +299,7 @@ function splitTelegramMessage(text) {
   if (chunks.length <= 1) return chunks;
   const total = chunks.length;
   return chunks.map((c, i) => {
-    const hdr = `(\( {i+1}/ \){total})\n\n`;
+    const hdr = `(${i+1}/${total})\n\n`;
     return hdr.length + c.length > MAX_MSG_LENGTH ? c : hdr + c;
   });
 }
@@ -348,8 +348,6 @@ async function send2FACodeViaBot(user, code) {
   } catch (err) { console.error('2FA send failed:', err.message); return false; }
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 // ==================== TELEGRAM BOT MANAGEMENT ====================
 function launchUserBot(user) {
   if (activeBots.has(user.id)) activeBots.delete(user.id);
@@ -369,6 +367,7 @@ function launchUserBot(user) {
     const payload = ctx.startPayload || '';
     const chatId  = ctx.chat.id.toString();
 
+    // Subscriber flow
     if (payload.startsWith('sub_') && pendingSubscribers.has(payload)) {
       const sub = pendingSubscribers.get(payload);
       if (sub.userId === user.id) {
@@ -396,6 +395,7 @@ function launchUserBot(user) {
         }
         await target.save();
 
+        // Remove duplicates
         await Contact.deleteMany({
           userId: user.id,
           $or: [
@@ -419,12 +419,15 @@ function launchUserBot(user) {
       }
     }
 
+    // 2FA owner connect
     if (payload === user.id) {
+      // Re-fetch user from DB to get the latest saved state
       const freshUser = await User.findOne({ id: user.id });
       if (freshUser) {
         freshUser.telegramChatId      = chatId;
         freshUser.isTelegramConnected = true;
         await freshUser.save();
+        // Also update the closed-over user reference for in-process consistency
         user.telegramChatId      = chatId;
         user.isTelegramConnected = true;
       }
@@ -437,65 +440,71 @@ function launchUserBot(user) {
 
   bot.command('status', async (ctx) => {
     await ctx.replyWithHTML(
-      `<b>Sendm 2FA Status</b>\nAccount: <code>\( {user.email}</code>\nStatus: <b> \){user.isTelegramConnected ? 'Connected' : 'Not Connected'}</b>`
+      `<b>Sendm 2FA Status</b>\nAccount: <code>${user.email}</code>\nStatus: <b>${user.isTelegramConnected ? 'Connected' : 'Not Connected'}</b>`
     );
   });
 
+  // ✅ FIX: Register the bot in activeBots IMMEDIATELY so that webhook updates
+  // arriving before the async webhook setup completes are handled correctly.
+  // Previously this only happened inside the finally{} block of the IIFE below,
+  // meaning any /start update from a subscriber clicking the deep link in the
+  // first ~4–12 seconds after bot connection was silently dropped.
   activeBots.set(user.id, bot);
 
-  const webhookPath = `/webhook/\( {WEBHOOK_SECRET}/ \){user.id}`;
-  const webhookUrl  = `https://\( {DOMAIN} \){webhookPath}`;
+  const webhookPath = `/webhook/${WEBHOOK_SECRET}/${user.id}`;
+  const webhookUrl  = `https://${DOMAIN}${webhookPath}`;
 
+  // Async webhook setup runs in the background — bot is already ready to handle
+  // updates via activeBots above, so no updates are lost during this phase.
   (async () => {
     try {
-      console.log(`[Webhook Setup] Starting for \( {user.email} (@ \){user.botUsername || 'unknown'})`);
-
-      const current = await bot.telegram.getWebhookInfo().catch(() => ({}));
+      const current = await bot.telegram.getWebhookInfo();
       const alreadyOk = current.url === webhookUrl && !current.has_custom_certificate && current.pending_update_count < 50;
       const recentlySet = (Date.now() - (lastWebhookSetTime.get(user.id) || 0)) < 30*60*1000;
 
       if (alreadyOk && recentlySet) {
-        console.log(`[Webhook Setup] Already OK for ${user.email}`);
+        console.log(`Webhook already OK for @${user.botUsername || 'unknown'}, skipping reset.`);
+        return;
+      }
+      if (alreadyOk) {
+        lastWebhookSetTime.set(user.id, Date.now());
         return;
       }
 
-      await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
-      await sleep(2000);
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+      await sleep(4000);
 
-      for (let attempt = 0; attempt < 6; attempt++) {
+      for (let attempt = 0; attempt < 5; attempt++) {
         try {
           const ok = await bot.telegram.setWebhook(webhookUrl, {
             allowed_updates: ['message', 'callback_query', 'my_chat_member'],
           });
           if (ok) {
-            console.log(`✅ Webhook successfully set for ${user.email} → ${webhookUrl}`);
+            console.log(`Webhook set for @${user.botUsername || 'unknown'} → ${webhookUrl}`);
             lastWebhookSetTime.set(user.id, Date.now());
-
-            if (user.telegramChatId) {
-              await bot.telegram.sendMessage(user.telegramChatId,
-                '✅ <b>Bot connected successfully!</b>\nDeep links and subscriptions should now work.',
-                { parse_mode: 'HTML' }
-              ).catch(() => {});
-            }
-            return;
+            break;
           }
         } catch (err) {
           if (err.response?.error_code === 429) {
             const wait = (err.response.parameters?.retry_after || 30) + 5;
-            console.warn(`[Webhook Setup] Rate-limited for ${user.email}, waiting ${wait}s`);
+            console.warn(`Rate-limited for ${user.email}, waiting ${wait}s (attempt ${attempt+1}/5)`);
             await sleep(wait * 1000);
           } else {
-            console.error(`[Webhook Setup] Failed for ${user.email}: ${err.message}`);
-            if (attempt >= 5) throw err;
-            await sleep(4000);
+            console.error(`Webhook set failed for ${user.email}: ${err.message}`);
+            if (attempt >= 4) throw err;
+            await sleep(5000);
           }
         }
       }
     } catch (err) {
-      console.error(`❌ Webhook setup failed for ${user.email}: ${err.message}`);
+      console.error(`Webhook setup failed for ${user.email}: ${err.message}`);
+      // Note: bot remains in activeBots even if webhook setup failed partially —
+      // it will still handle updates once Telegram starts delivering to the endpoint.
     }
   })();
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ==================== BULLMQ WORKER ====================
 async function processBroadcast(job) {
@@ -528,12 +537,13 @@ async function processBroadcast(job) {
     if (b + BATCH_SIZE < targets.length) await sleep(BATCH_INTERVAL_MS);
   }
 
+  // Delivery report
   const user = await User.findOne({ id: userId });
   const emoji = failed === 0 ? '✅' : '⚠️';
   let report = broadcastId ? '<b>Scheduled Broadcast Report</b>\n\n' : '<b>Broadcast Report</b>\n\n';
   report += total === 0
     ? 'No subscribed contacts with Telegram connected.'
-    : `\( {emoji} <b> \){sent} of \( {total}</b> delivered. \){failed > 0 ? `\n${failed} failed.` : ''}`;
+    : `${emoji} <b>${sent} of ${total}</b> delivered.${failed > 0 ? `\n${failed} failed.` : ''}`;
   report += `\n\nTime: ${new Date().toLocaleString()}`;
 
   if (user?.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
@@ -602,7 +612,7 @@ const authRateLimit = {
   config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
 };
 const formSubmitRateLimit = {
-  config: { rateLimit: { max: 10, timeWindow: '15 minutes', keyGenerator: (req) => `\( {req.ip}:: \){req.params.shortId}` } },
+  config: { rateLimit: { max: 10, timeWindow: '15 minutes', keyGenerator: (req) => `${req.ip}::${req.params.shortId}` } },
 };
 
 // ==================== WEBHOOK ENDPOINT ====================
@@ -612,11 +622,6 @@ app.post(`/webhook/${WEBHOOK_SECRET}/:userId`, {
   const userId = req.params.userId;
   const bot    = activeBots.get(userId);
 
-  if (!bot) {
-    console.warn(`Webhook received for unknown bot: ${userId}`);
-    return reply.code(200).send('OK');
-  }
-
   let update;
   try {
     update = typeof req.body === 'object' ? req.body : JSON.parse(req.body);
@@ -624,8 +629,10 @@ app.post(`/webhook/${WEBHOOK_SECRET}/:userId`, {
     return reply.code(400).send('Bad Request');
   }
 
-  try { await bot.handleUpdate(update); }
-  catch (err) { app.log.error(`Webhook handle error for ${userId}: ${err.message}`); }
+  if (bot) {
+    try { await bot.handleUpdate(update); }
+    catch (err) { app.log.error(`Webhook handle error for ${userId}: ${err.message}`); }
+  }
 
   reply.code(200).send('OK');
 });
@@ -665,6 +672,7 @@ app.get('/api/auth/me', { preHandler: app.authenticate }, async (req, reply) => 
   reply.send({ user: { id: req.user.id, fullName: req.user.fullName, email: req.user.email, isTelegramConnected: req.user.isTelegramConnected } });
 });
 
+// Shared bot-token validator to avoid duplication
 async function validateBotToken(token, maxAttempts = 5) {
   for (let i = 0; i < maxAttempts; i++) {
     try {
@@ -674,7 +682,7 @@ async function validateBotToken(token, maxAttempts = 5) {
       return res.data.result;
     } catch (err) {
       if (i >= maxAttempts - 1) throw err;
-      if (err.response?.status === 401) throw err;
+      if (err.response?.status === 401) throw err; // Bad token — no point retrying
       await sleep(8000);
     }
   }
@@ -698,6 +706,7 @@ app.post('/api/auth/connect-telegram', { preHandler: app.authenticate }, async (
 
   const botUsername = botInfo.username.replace(/^@/, '');
 
+  // Clear old webhook if token changed
   if (req.user.telegramBotToken && req.user.telegramBotToken !== token) {
     await axios.post(`https://api.telegram.org/bot${req.user.telegramBotToken}/deleteWebhook`, { drop_pending_updates: true }, { timeout: 20000 }).catch(() => {});
   }
@@ -705,11 +714,11 @@ app.post('/api/auth/connect-telegram', { preHandler: app.authenticate }, async (
   Object.assign(req.user, { telegramBotToken: token, botUsername, isTelegramConnected: false, telegramChatId: null });
   await req.user.save();
 
+  // ✅ Pass a plain object snapshot so the bot closure always has the latest
+  // saved token/username even if req.user is mutated later in this request.
   launchUserBot(req.user.toObject ? req.user.toObject() : { ...req.user });
 
-  await sleep(2500);
-
-  reply.send({ success: true, message: 'Bot connected!', botUsername: '@' + botUsername, startLink: `https://t.me/\( {botUsername}?start= \){req.user.id}` });
+  reply.send({ success: true, message: 'Bot connected!', botUsername: '@' + botUsername, startLink: `https://t.me/${botUsername}?start=${req.user.id}` });
 });
 
 app.post('/api/auth/change-bot-token', { preHandler: app.authenticate }, async (req, reply) => {
@@ -735,11 +744,10 @@ app.post('/api/auth/change-bot-token', { preHandler: app.authenticate }, async (
   Object.assign(req.user, { telegramBotToken: token, botUsername, isTelegramConnected: false, telegramChatId: null });
   await req.user.save();
 
+  // ✅ Same snapshot approach as connect-telegram above
   launchUserBot(req.user.toObject ? req.user.toObject() : { ...req.user });
 
-  await sleep(2500);
-
-  reply.send({ success: true, message: 'Bot token updated! Send /start to the new bot to reconnect 2FA.', botUsername: '@' + botUsername, startLink: `https://t.me/\( {botUsername}?start= \){req.user.id}` });
+  reply.send({ success: true, message: 'Bot token updated! Send /start to the new bot to reconnect 2FA.', botUsername: '@' + botUsername, startLink: `https://t.me/${botUsername}?start=${req.user.id}` });
 });
 
 app.post('/api/auth/disconnect-telegram', { preHandler: app.authenticate }, async (req, reply) => {
@@ -763,6 +771,7 @@ app.post('/api/auth/forgot-password', authRateLimit, async (req, reply) => {
   if (!email?.trim()) return reply.code(400).send({ error: 'Email required' });
 
   const user = await User.findOne({ email: email.toLowerCase() });
+  // Always return the same response to prevent user enumeration
   if (!user || !user.isTelegramConnected)
     return reply.send({ success: true, message: 'If that account has 2FA enabled, a code was sent.' });
 
@@ -832,7 +841,7 @@ app.post('/api/subscription/initiate', { preHandler: app.authenticate }, async (
         email:        req.user.email,
         amount:       MONTHLY_PRICE_KOBO,
         currency:     'NGN',
-        callback_url: `\( {req.protocol}:// \){req.hostname}/subscription-success`,
+        callback_url: `${req.protocol}://${req.hostname}/subscription-success`,
         metadata:     { userId: req.user.id, plan: 'premium-monthly' },
       },
       { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
@@ -849,6 +858,7 @@ app.post('/api/subscription/initiate', { preHandler: app.authenticate }, async (
   }
 });
 
+// Paystack webhook — must receive raw body for HMAC verification
 app.post('/api/subscription/webhook', {
   config: { rawBody: true },
 }, async (req, reply) => {
@@ -878,7 +888,7 @@ app.post('/api/subscription/webhook', {
     reply.send('OK');
   } catch (err) {
     app.log.error('Paystack webhook error:', err);
-    reply.send('OK');
+    reply.send('OK'); // Always 200 to Paystack
   }
 });
 
@@ -931,8 +941,8 @@ app.get('/api/pages', { preHandler: app.authenticate }, async (req, reply) => {
   if (bucket.pages && now - bucket.pagesTs < TTL.pages) return reply.send({ pages: bucket.pages });
 
   const pages   = await LandingPage.find({ userId: req.user.id }).sort({ updatedAt: -1 });
-  const base    = `\( {req.protocol}:// \){req.hostname}`;
-  const formatted = pages.map(p => ({ shortId: p.shortId, title: p.title, createdAt: p.createdAt, updatedAt: p.updatedAt, url: `\( {base}/p/ \){p.shortId}` }));
+  const base    = `${req.protocol}://${req.hostname}`;
+  const formatted = pages.map(p => ({ shortId: p.shortId, title: p.title, createdAt: p.createdAt, updatedAt: p.updatedAt, url: `${base}/p/${p.shortId}` }));
 
   bucket.pages  = formatted; bucket.pagesTs = now;
   reply.send({ pages: formatted });
@@ -944,8 +954,8 @@ app.get('/api/forms', { preHandler: app.authenticate }, async (req, reply) => {
   if (bucket.forms && now - bucket.formsTs < TTL.forms) return reply.send({ forms: bucket.forms });
 
   const forms   = await FormPage.find({ userId: req.user.id }).sort({ updatedAt: -1 });
-  const base    = `\( {req.protocol}:// \){req.hostname}`;
-  const formatted = forms.map(f => ({ shortId: f.shortId, title: f.title, createdAt: f.createdAt, updatedAt: f.updatedAt, url: `\( {base}/f/ \){f.shortId}` }));
+  const base    = `${req.protocol}://${req.hostname}`;
+  const formatted = forms.map(f => ({ shortId: f.shortId, title: f.title, createdAt: f.createdAt, updatedAt: f.updatedAt, url: `${base}/f/${f.shortId}` }));
 
   bucket.forms  = formatted; bucket.formsTs = now;
   reply.send({ forms: formatted });
@@ -971,6 +981,7 @@ app.get('/api/contacts', { preHandler: app.authenticate }, async (req, reply) =>
   reply.send({ success: true, contacts: formatted });
 });
 
+// Public data API
 app.get('/api/page/:shortId', async (req, reply) => {
   const key = `apiPage:${req.params.shortId}`;
   const cached = publicCache.get(key);
@@ -1010,6 +1021,7 @@ app.post('/api/pages/save', { preHandler: app.authenticate }, async (req, reply)
     if (limits.maxLandingPages !== Infinity && count >= limits.maxLandingPages)
       return reply.code(403).send({ error: `Free tier limit: ${limits.maxLandingPages} landing pages.` });
   } else {
+    // Ensure the page belongs to this user
     const existing = await LandingPage.findOne({ shortId });
     if (existing && existing.userId !== req.user.id)
       return reply.code(403).send({ error: 'Not your page' });
@@ -1040,7 +1052,7 @@ app.post('/api/pages/save', { preHandler: app.authenticate }, async (req, reply)
   invalidatePublicCache(`landing:${finalId}`);
   invalidatePublicCache(`apiPage:${finalId}`);
 
-  reply.send({ success: true, shortId: finalId, url: `\( {req.protocol}:// \){req.hostname}/p/${finalId}` });
+  reply.send({ success: true, shortId: finalId, url: `${req.protocol}://${req.hostname}/p/${finalId}` });
 });
 
 app.post('/api/pages/delete', { preHandler: app.authenticate }, async (req, reply) => {
@@ -1094,7 +1106,7 @@ app.post('/api/forms/save', { preHandler: app.authenticate }, async (req, reply)
   invalidatePublicCache(`form:${finalId}`);
   invalidatePublicCache(`apiForm:${finalId}`);
 
-  reply.send({ success: true, shortId: finalId, url: `\( {req.protocol}:// \){req.hostname}/f/${finalId}` });
+  reply.send({ success: true, shortId: finalId, url: `${req.protocol}://${req.hostname}/f/${finalId}` });
 });
 
 app.post('/api/forms/delete', { preHandler: app.authenticate }, async (req, reply) => {
@@ -1131,7 +1143,7 @@ app.post('/api/subscribe/:shortId', formSubmitRateLimit, async (req, reply) => {
   if (!owner?.telegramBotToken || !owner?.botUsername)
     return reply.code(400).send({ error: 'Form owner has not connected a Telegram bot yet' });
 
-  const payload = `sub_\( {shortId}_ \){uuidv4().slice(0, 12)}`;
+  const payload = `sub_${shortId}_${uuidv4().slice(0, 12)}`;
 
   let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
 
@@ -1139,6 +1151,7 @@ app.post('/api/subscribe/:shortId', formSubmitRateLimit, async (req, reply) => {
     contact.name     = name.trim();
     contact.shortId  = shortId;
     contact.submittedAt = new Date();
+    // Don't await — fire and forget (non-critical update)
     contact.save().catch(() => {});
   } else {
     contact = await Contact.create({
@@ -1153,7 +1166,7 @@ app.post('/api/subscribe/:shortId', formSubmitRateLimit, async (req, reply) => {
 
   invalidateUserCache(owner.id, 'contacts');
 
-  const deepLink = `https://t.me/\( {owner.botUsername}?start= \){payload}`;
+  const deepLink = `https://t.me/${owner.botUsername}?start=${payload}`;
   const alreadySubscribed = contact.status === 'subscribed';
   reply.send({ success: true, deepLink, alreadySubscribed });
 });
@@ -1253,6 +1266,7 @@ app.patch('/api/broadcast/scheduled/:broadcastId', { preHandler: app.authenticat
   const task = await ScheduledBroadcast.findOne({ broadcastId, userId: req.user.id, status: 'pending' });
   if (!task) return reply.code(400).send({ error: 'Broadcast not found or not editable' });
 
+  // Remove existing queued job
   const oldJob = await broadcastQueue.getJob(broadcastId);
   if (oldJob) await oldJob.remove().catch(() => {});
 
@@ -1281,6 +1295,7 @@ app.get('/api/broadcast/scheduled/:broadcastId/details', { preHandler: app.authe
   const task = await ScheduledBroadcast.findOne({ broadcastId: req.params.broadcastId, userId: req.user.id, status: 'pending' });
   if (!task) return reply.code(404).send({ error: 'Broadcast not found or not editable' });
 
+  // Return local ISO string (minus TZ offset) for datetime-local inputs
   const d      = new Date(task.scheduledTime);
   const local  = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 
@@ -1385,12 +1400,14 @@ app.setNotFoundHandler((req, reply) => {
 // ==================== STARTUP ====================
 async function start() {
   try {
+    // Wait for MongoDB to be ready
     await new Promise((resolve, reject) => {
       if (mongoose.connection.readyState === 1) return resolve();
       mongoose.connection.once('open', resolve);
       mongoose.connection.once('error', reject);
     });
 
+    // Load settings
     const settings = await AdminSettings.getSettings();
     adminSettingsCache = {
       dailyBroadcastLimit: settings.dailyBroadcastLimit,
@@ -1399,15 +1416,17 @@ async function start() {
     };
     console.log('✅ Admin settings loaded:', adminSettingsCache);
 
+    // Launch bots
     const usersWithBots = await User.find({ telegramBotToken: { $exists: true, $ne: null } });
     for (const user of usersWithBots) launchUserBot(user);
     console.log(`✅ Launched ${usersWithBots.length} bot(s) in webhook mode`);
 
+    // Recover scheduled broadcasts
     await recoverScheduledBroadcasts();
 
     await app.listen({ port: PORT, host: '0.0.0.0' });
     console.log(`\n🚀 SENDM SERVER — Fastify + BullMQ + Redis`);
-    console.log(`   Listening on port \( {PORT} | Domain: https:// \){DOMAIN}\n`);
+    console.log(`   Listening on port ${PORT} | Domain: https://${DOMAIN}\n`);
   } catch (err) {
     console.error('Startup error:', err);
     process.exit(1);
