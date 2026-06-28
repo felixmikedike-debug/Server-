@@ -421,9 +421,16 @@ function launchUserBot(user) {
 
     // 2FA owner connect
     if (payload === user.id) {
-      user.telegramChatId     = chatId;
-      user.isTelegramConnected= true;
-      await user.save();
+      // Re-fetch user from DB to get the latest saved state
+      const freshUser = await User.findOne({ id: user.id });
+      if (freshUser) {
+        freshUser.telegramChatId      = chatId;
+        freshUser.isTelegramConnected = true;
+        await freshUser.save();
+        // Also update the closed-over user reference for in-process consistency
+        user.telegramChatId      = chatId;
+        user.isTelegramConnected = true;
+      }
       await ctx.replyWithHTML('<b>Sendm 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
       return;
     }
@@ -437,9 +444,18 @@ function launchUserBot(user) {
     );
   });
 
+  // ✅ FIX: Register the bot in activeBots IMMEDIATELY so that webhook updates
+  // arriving before the async webhook setup completes are handled correctly.
+  // Previously this only happened inside the finally{} block of the IIFE below,
+  // meaning any /start update from a subscriber clicking the deep link in the
+  // first ~4–12 seconds after bot connection was silently dropped.
+  activeBots.set(user.id, bot);
+
   const webhookPath = `/webhook/${WEBHOOK_SECRET}/${user.id}`;
   const webhookUrl  = `https://${DOMAIN}${webhookPath}`;
 
+  // Async webhook setup runs in the background — bot is already ready to handle
+  // updates via activeBots above, so no updates are lost during this phase.
   (async () => {
     try {
       const current = await bot.telegram.getWebhookInfo();
@@ -447,11 +463,12 @@ function launchUserBot(user) {
       const recentlySet = (Date.now() - (lastWebhookSetTime.get(user.id) || 0)) < 30*60*1000;
 
       if (alreadyOk && recentlySet) {
-        activeBots.set(user.id, bot); return;
+        console.log(`Webhook already OK for @${user.botUsername || 'unknown'}, skipping reset.`);
+        return;
       }
       if (alreadyOk) {
         lastWebhookSetTime.set(user.id, Date.now());
-        activeBots.set(user.id, bot); return;
+        return;
       }
 
       await bot.telegram.deleteWebhook({ drop_pending_updates: true });
@@ -481,8 +498,8 @@ function launchUserBot(user) {
       }
     } catch (err) {
       console.error(`Webhook setup failed for ${user.email}: ${err.message}`);
-    } finally {
-      activeBots.set(user.id, bot);
+      // Note: bot remains in activeBots even if webhook setup failed partially —
+      // it will still handle updates once Telegram starts delivering to the endpoint.
     }
   })();
 }
@@ -696,7 +713,10 @@ app.post('/api/auth/connect-telegram', { preHandler: app.authenticate }, async (
 
   Object.assign(req.user, { telegramBotToken: token, botUsername, isTelegramConnected: false, telegramChatId: null });
   await req.user.save();
-  launchUserBot(req.user);
+
+  // ✅ Pass a plain object snapshot so the bot closure always has the latest
+  // saved token/username even if req.user is mutated later in this request.
+  launchUserBot(req.user.toObject ? req.user.toObject() : { ...req.user });
 
   reply.send({ success: true, message: 'Bot connected!', botUsername: '@' + botUsername, startLink: `https://t.me/${botUsername}?start=${req.user.id}` });
 });
@@ -723,7 +743,9 @@ app.post('/api/auth/change-bot-token', { preHandler: app.authenticate }, async (
 
   Object.assign(req.user, { telegramBotToken: token, botUsername, isTelegramConnected: false, telegramChatId: null });
   await req.user.save();
-  launchUserBot(req.user);
+
+  // ✅ Same snapshot approach as connect-telegram above
+  launchUserBot(req.user.toObject ? req.user.toObject() : { ...req.user });
 
   reply.send({ success: true, message: 'Bot token updated! Send /start to the new bot to reconnect 2FA.', botUsername: '@' + botUsername, startLink: `https://t.me/${botUsername}?start=${req.user.id}` });
 });
