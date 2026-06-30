@@ -16,7 +16,7 @@ const { Queue, Worker } = require('bullmq');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-('trust proxy', 3);
+app.set('trust proxy', 3);
 
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
@@ -287,6 +287,9 @@ const activeBots = new Map();
 const resetTokens = new Map();
 const pendingSubscribers = new Map();
 const lastWebhookSetTime = new Map();
+// Tracks an in-flight webhook-negotiation generation per user so that
+// rapid token changes can't have an old retry loop clobber a new bot.
+const webhookSetupGeneration = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
 function launchUserBot(user) {
@@ -393,8 +396,22 @@ function launchUserBot(user) {
     await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + user.email + '</code>\nStatus: <b>' + (user.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
   });
 
+  // FIX: Register the bot immediately so it can start handling incoming
+  // webhook updates right away, instead of waiting for the (potentially
+  // slow, retry-laden) webhook negotiation below to finish. Previously
+  // activeBots.set(user.id, bot) only happened inside the async IIFE's
+  // success paths or its `finally` block — and the `finally` could never
+  // run if the retry loop below got stuck, leaving the user with NO bot
+  // registered (and "no reply"/"default reply only") until a server restart.
+  activeBots.set(user.id, bot);
+
   const webhookPath = '/webhook/' + WEBHOOK_SECRET + '/' + user.id;
   const webhookUrl = 'https://' + DOMAIN + webhookPath;
+
+  // Bump generation for this user so any older, still-running negotiation
+  // loop (from a previous token) knows to stop touching shared state.
+  const myGeneration = (webhookSetupGeneration.get(user.id) || 0) + 1;
+  webhookSetupGeneration.set(user.id, myGeneration);
 
   (async () => {
     try {
@@ -410,14 +427,12 @@ function launchUserBot(user) {
 
       if (alreadyCorrect && recentlySet) {
         console.log('Webhook already perfect & recent for ' + user.email + ' → skipping');
-        activeBots.set(user.id, bot);
         return;
       }
 
       if (alreadyCorrect) {
         console.log('Webhook correct but old → refreshing timestamp for ' + user.email);
         lastWebhookSetTime.set(user.id, Date.now());
-        activeBots.set(user.id, bot);
         return;
       }
 
@@ -433,17 +448,19 @@ function launchUserBot(user) {
       const maxAttempts = 5; // Increased attempts for network reliability
 
       while (attempts < maxAttempts) {
+        // If a newer launchUserBot() call for this user has started
+        // (e.g. the user changed their bot token again), abandon this
+        // stale negotiation instead of fighting over activeBots/webhook state.
+        if (webhookSetupGeneration.get(user.id) !== myGeneration) {
+          console.log('Abandoning stale webhook negotiation for ' + user.email + ' (superseded)');
+          return;
+        }
+
+        let success = false;
         try {
-          const success = await bot.telegram.setWebhook(webhookUrl, {
+          success = await bot.telegram.setWebhook(webhookUrl, {
             allowed_updates: ['message', 'callback_query', 'my_chat_member']
           });
-
-          if (success) {
-            console.log('Webhook SUCCESSFULLY set for @' + (user.botUsername || 'unknown') + ' → ' + webhookUrl);
-            lastWebhookSetTime.set(user.id, Date.now());
-            activeBots.set(user.id, bot);
-            return;
-          }
         } catch (err) {
           attempts++;
           if (err.response && err.response.error_code === 429) {
@@ -453,20 +470,38 @@ function launchUserBot(user) {
           } else {
             console.error('Webhook set FAILED for ' + user.email + ': ' + err.message);
             if (attempts >= maxAttempts) {
-              throw err;
+              console.error('Giving up on webhook setup for ' + user.email + ' after ' + maxAttempts + ' attempts (error). Bot remains registered and can still receive updates once webhook propagates or is set manually.');
+              return;
             }
             await new Promise(r => setTimeout(r, 5000)); // Extra delay on failure
           }
+          continue;
         }
+
+        if (success) {
+          console.log('Webhook SUCCESSFULLY set for @' + (user.botUsername || 'unknown') + ' → ' + webhookUrl);
+          lastWebhookSetTime.set(user.id, Date.now());
+          return;
+        }
+
+        // FIX: setWebhook resolved but returned a falsy value (no error
+        // thrown). This used to loop forever with no delay and no
+        // increment to `attempts`, hammering Telegram's API and never
+        // exiting the while loop — which also meant the `finally` below
+        // never ran. Now we always count it as an attempt and back off.
+        attempts++;
+        console.warn('setWebhook returned false for ' + user.email + ' (attempt ' + attempts + '/' + maxAttempts + '), retrying with backoff');
+        await new Promise(r => setTimeout(r, 3000 * attempts));
       }
 
       console.error('Gave up setting webhook for ' + user.email + ' after ' + maxAttempts + ' attempts');
     } catch (err) {
       console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
-    } finally {
-      // Always register the bot instance even if webhook failed (it can still handle incoming updates)
-      activeBots.set(user.id, bot);
     }
+    // Note: no `finally` re-registration needed anymore — the bot was
+    // already placed in activeBots synchronously above, before this IIFE
+    // even started, so it stays available regardless of how webhook
+    // negotiation turns out.
   })();
 }
 
@@ -570,7 +605,7 @@ function escapeHtml(unsafe) {
 
 function textToHtmlForDisplay(text) {
   if (!text) return '';
-  
+
   return text
     .replace(/\n{2,}/g, '</p><p>')
     .replace(/\n/g, '<br>');
@@ -755,7 +790,7 @@ worker.on('failed', async function(job, err) {
   const user = await User.findOne({ id: userId });
   if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
     const bot = activeBots.get(userId);
-    const text = broadcastId 
+    const text = broadcastId
       ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message
       : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
     try {
@@ -928,8 +963,8 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
         timeout: 20000 // Increased timeout
       });
       if (!response.data.ok) {
-        return res.status(400).json({ 
-          error: 'Invalid bot token – Telegram rejected it: ' + (response.data.description || 'Unauthorized') 
+        return res.status(400).json({
+          error: 'Invalid bot token – Telegram rejected it: ' + (response.data.description || 'Unauthorized')
         });
       }
       botInfo = response.data.result;
@@ -1000,8 +1035,8 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
         timeout: 20000
       });
       if (!response.data.ok) {
-        return res.status(400).json({ 
-          error: 'Invalid new token – Telegram rejected it: ' + (response.data.description || 'Unauthorized') 
+        return res.status(400).json({
+          error: 'Invalid new token – Telegram rejected it: ' + (response.data.description || 'Unauthorized')
         });
       }
       botInfo = response.data.result;
@@ -1067,6 +1102,9 @@ app.post('/api/auth/disconnect-telegram', authenticateToken, async function(req,
   if (activeBots.has(req.user.id)) {
     activeBots.delete(req.user.id);
   }
+  // Bump generation so any in-flight webhook negotiation for the old
+  // token abandons itself instead of re-registering a stale bot.
+  webhookSetupGeneration.set(req.user.id, (webhookSetupGeneration.get(req.user.id) || 0) + 1);
 
   req.user.telegramBotToken = null;
   req.user.botUsername = null;
@@ -1272,9 +1310,9 @@ app.get('/p/:shortId', async function(req, res) {
     return block;
   });
 
-  const data = { 
-    title: page.title, 
-    blocks: processedBlocks 
+  const data = {
+    title: page.title,
+    blocks: processedBlocks
   };
 
   publicCache.set(key, { data: data, timestamp: Date.now() });
@@ -1648,9 +1686,9 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     backoff: { type: 'exponential', delay: 5000 }
   });
 
-  res.json({ 
-    success: true, 
-    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.' 
+  res.json({
+    success: true,
+    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.'
   });
 });
 
@@ -1992,4 +2030,3 @@ app.listen(PORT, function() {
   console.log('\nSENDEM SERVER — FULL VERSION WITH BullMQ + Redis BROADCAST QUEUE');
   console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
-  
