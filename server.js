@@ -285,8 +285,39 @@ broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 // In-memory helpers
 const activeBots = new Map();
 const resetTokens = new Map();
-const pendingSubscribers = new Map();
 const lastWebhookSetTime = new Map();
+
+// ==================== PENDING SUBSCRIBERS (REDIS-BACKED) ====================
+// Previously an in-memory Map. Moved to Redis so entries survive process
+// restarts/redeploys and are visible across instances if you ever scale
+// horizontally. Each entry auto-expires via Redis TTL (30 min), replacing
+// the old manual setInterval cleanup.
+const PENDING_SUB_PREFIX = 'pending_sub:';
+const PENDING_SUB_TTL_SECONDS = 30 * 60;
+
+async function setPendingSubscriber(payload, data) {
+  await redisConnection.set(
+    PENDING_SUB_PREFIX + payload,
+    JSON.stringify({ ...data, createdAt: Date.now() }),
+    'EX',
+    PENDING_SUB_TTL_SECONDS
+  );
+}
+
+async function getPendingSubscriber(payload) {
+  const raw = await redisConnection.get(PENDING_SUB_PREFIX + payload);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error('Failed to parse pending subscriber entry for payload ' + payload + ':', err);
+    return null;
+  }
+}
+
+async function deletePendingSubscriber(payload) {
+  await redisConnection.del(PENDING_SUB_PREFIX + payload);
+}
 // Tracks an in-flight webhook-negotiation generation per user so that
 // rapid token changes can't have an old retry loop clobber a new bot.
 const webhookSetupGeneration = new Map();
@@ -318,8 +349,19 @@ function launchUserBot(user) {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
 
-    if (payload.startsWith('sub_') && pendingSubscribers.has(payload)) {
-      const sub = pendingSubscribers.get(payload);
+    const sub = payload.startsWith('sub_') ? await getPendingSubscriber(payload) : null;
+
+    // DIAGNOSTIC LOGGING — remove once the root cause is confirmed
+    console.log('[bot.start] DEBUG', JSON.stringify({
+      handlerBoundToUserId: user.id,
+      handlerBoundToEmail: user.email,
+      handlerBoundToBotTokenTail: (user.telegramBotToken || '').slice(-8),
+      receivedPayload: payload,
+      foundInRedis: !!sub,
+      storedEntryUserId: sub?.userId || null
+    }));
+
+    if (sub) {
       if (sub.userId === user.id) {
         let targetContact = await Contact.findOne({
           userId: user.id,
@@ -365,7 +407,7 @@ function launchUserBot(user) {
           ]
         });
 
-        pendingSubscribers.delete(payload);
+        await deletePendingSubscriber(payload);
 
         const form = await FormPage.findOne({ shortId: sub.shortId });
         let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
@@ -1592,6 +1634,16 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
   const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
 
+  // DIAGNOSTIC LOGGING — remove once the root cause is confirmed
+  console.log('[subscribe] DEBUG creating payload', JSON.stringify({
+    payload,
+    ownerId: owner.id,
+    ownerEmail: owner.email,
+    ownerBotTokenTail: (owner.telegramBotToken || '').slice(-8),
+    ownerBotUsername: owner.botUsername,
+    activeBotsHasOwner: activeBots.has(owner.id)
+  }));
+
   let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
 
   if (contact) {
@@ -1601,12 +1653,11 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
       contact.submittedAt = new Date();
       await contact.save();
 
-      pendingSubscribers.set(payload, {
+      await setPendingSubscriber(payload, {
         userId: owner.id,
         shortId: shortId,
         name: name.trim(),
-        contact: contactValue,
-        createdAt: Date.now()
+        contact: contactValue
       });
 
       const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
@@ -1628,12 +1679,11 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
     await contact.save();
   }
 
-  pendingSubscribers.set(payload, {
+  await setPendingSubscriber(payload, {
     userId: owner.id,
     shortId: shortId,
     name: name.trim(),
-    contact: contactValue,
-    createdAt: Date.now()
+    contact: contactValue
   });
 
   const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
@@ -1964,16 +2014,8 @@ app.post('/admin-limits', async function(req, res) {
 });
 
 // ==================== CLEANUP ====================
-setInterval(function() {
-  const now = Date.now();
-  const keys = Array.from(pendingSubscribers.keys());
-  for (const key of keys) {
-    const data = pendingSubscribers.get(key);
-    if (now - data.createdAt > 30 * 60 * 1000) {
-      pendingSubscribers.delete(key);
-    }
-  }
-}, 60 * 60 * 1000);
+// Pending subscriber entries now expire automatically via Redis TTL
+// (see PENDING_SUB_TTL_SECONDS), so no manual interval sweep is needed here.
 
 // ==================== STARTUP ====================
 async function loadAdminSettings() {
