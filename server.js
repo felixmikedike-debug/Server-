@@ -437,6 +437,11 @@ class BotManager {
       const payload = ctx.startPayload || '';
       const chatId = ctx.chat.id.toString();
 
+      // DIAGNOSTIC: confirms which user's bot handler actually fired, and
+      // the raw payload Telegram sent. Compare "handler.userId" against
+      // "handler.botUsername" and the chat that triggered it.
+      console.log('[SUB-DEBUG] /start received — handler.userId=' + user.id + ' handler.email=' + user.email + ' handler.botUsername=' + user.botUsername + ' payload="' + payload + '" chatId=' + chatId);
+
       if (payload.startsWith('sub_')) {
         const sub = await resolvePendingSubscription(payload, user.id);
 
@@ -639,13 +644,35 @@ async function createPendingSubscription(payload, userId, shortId, name, contact
 
 async function resolvePendingSubscription(payload, userId) {
   const cached = pendingSubscribers.get(payload);
-  if (cached && cached.userId === userId) return cached;
+  if (cached && cached.userId === userId) {
+    console.log('[SUB-DEBUG] resolved from memory cache: payload=' + payload + ' userId=' + userId);
+    return cached;
+  }
+
+  // DIAGNOSTIC: log why the in-memory cache missed, and check whether the
+  // doc exists at all in Mongo (regardless of userId) vs. truly not existing.
+  if (cached) {
+    console.log('[SUB-DEBUG] memory cache HIT but userId mismatch: payload=' + payload + ' cached.userId=' + cached.userId + ' requested.userId=' + userId);
+  } else {
+    console.log('[SUB-DEBUG] memory cache MISS: payload=' + payload + ' userId=' + userId);
+  }
 
   const doc = await PendingSubscription.findOne({ payload, userId }).lean();
   if (doc) {
+    console.log('[SUB-DEBUG] resolved from Mongo: payload=' + payload + ' userId=' + userId);
     pendingSubscribers.set(payload, doc);
     return doc;
   }
+
+  // Check if the doc exists under a DIFFERENT userId — this tells us if the
+  // payload was created for one user but looked up under another.
+  const anyDoc = await PendingSubscription.findOne({ payload }).lean();
+  if (anyDoc) {
+    console.log('[SUB-DEBUG] payload exists in Mongo but for a DIFFERENT userId! payload=' + payload + ' doc.userId=' + anyDoc.userId + ' requested.userId=' + userId);
+  } else {
+    console.log('[SUB-DEBUG] payload does not exist in Mongo at all (expired/never created/already consumed): payload=' + payload);
+  }
+
   return null;
 }
 
