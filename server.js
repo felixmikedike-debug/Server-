@@ -1266,7 +1266,13 @@ app.get('/f/:shortId', async function(req, res) {
   const form = await FormPage.findOne({ shortId: req.params.shortId });
   if (!form) return res.status(404).render('404');
 
-  const data = { title: form.title, state: form.state };
+  const owner = await User.findOne({ id: form.userId }, { botUsername: 1 });
+
+  const data = {
+    title: form.title,
+    state: form.state,
+    subscribeLink: owner && owner.botUsername ? 'https://t.me/' + owner.botUsername : null
+  };
   publicCache.set(key, { data: data, timestamp: Date.now() });
   res.render('form', data);
 });
