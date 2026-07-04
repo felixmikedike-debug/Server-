@@ -74,9 +74,6 @@ if (process.env.REDIS_URL) {
 
 const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
 
-// ==================== CONTACT VALIDATION REGEX ====================
-const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
-
 // ==================== PER-USER & PUBLIC CACHE WITH TTL ====================
 const userCache = new Map();
 const publicCache = new Map();
@@ -285,7 +282,6 @@ broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 // In-memory helpers
 const activeBots = new Map();
 const resetTokens = new Map();
-const pendingSubscribers = new Map();
 const lastWebhookSetTime = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
@@ -314,70 +310,9 @@ function launchUserBot(user) {
   bot.start(async (ctx) => {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
+    const tgUsername = ctx.chat.username || null;
 
-    if (payload.startsWith('sub_') && pendingSubscribers.has(payload)) {
-      const sub = pendingSubscribers.get(payload);
-      if (sub.userId === user.id) {
-        let targetContact = await Contact.findOne({
-          userId: user.id,
-          telegramChatId: chatId
-        });
-
-        const contactsByEmail = await Contact.find({ userId: user.id, contact: sub.contact });
-
-        if (!targetContact) {
-          targetContact = contactsByEmail.find(c => c.status === 'subscribed') ||
-                          contactsByEmail.find(c => c.shortId === sub.shortId) ||
-                          contactsByEmail[0];
-        }
-
-        if (!targetContact) {
-          targetContact = new Contact({
-            userId: user.id,
-            shortId: sub.shortId,
-            name: sub.name,
-            contact: sub.contact,
-            telegramChatId: chatId,
-            status: 'subscribed',
-            submittedAt: new Date(),
-            subscribedAt: new Date()
-          });
-        } else {
-          targetContact.name = sub.name;
-          targetContact.contact = sub.contact;
-          targetContact.shortId = sub.shortId;
-          targetContact.telegramChatId = chatId;
-          targetContact.status = 'subscribed';
-          targetContact.subscribedAt = targetContact.subscribedAt || new Date();
-          targetContact.submittedAt = new Date();
-        }
-
-        await targetContact.save();
-
-        await Contact.deleteMany({
-          userId: user.id,
-          $or: [
-            { contact: sub.contact, _id: { $ne: targetContact._id } },
-            { telegramChatId: chatId, _id: { $ne: targetContact._id } }
-          ]
-        });
-
-        pendingSubscribers.delete(payload);
-
-        const form = await FormPage.findOne({ shortId: sub.shortId });
-        let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
-
-        if (form && form.welcomeMessage && form.welcomeMessage.trim()) {
-          welcomeText = form.welcomeMessage
-            .replace(/\{name\}/gi, '<b>' + escapeHtml(sub.name) + '</b>')
-            .replace(/\{contact\}/gi, escapeHtml(sub.contact));
-        }
-
-        await ctx.replyWithHTML(welcomeText);
-        return;
-      }
-    }
-
+    // 2FA-connect flow for the account owner: /start <userId>
     if (payload === user.id) {
       user.telegramChatId = chatId;
       user.isTelegramConnected = true;
@@ -386,7 +321,60 @@ function launchUserBot(user) {
       return;
     }
 
-    await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
+    // ---- Simplified subscription flow ----
+    // No payload, no name/email form, no per-form segmentation. This bot
+    // belongs to exactly one account, so anyone who hits /start is simply
+    // subscribed under that account, identified only by their Telegram
+    // @username.
+    if (!tgUsername) {
+      await ctx.replyWithHTML(
+        '<b>Telegram Username Required</b>\n\n' +
+        'You need to set a Telegram username before you can subscribe.\n\n' +
+        'Go to Settings → Edit Profile → Username in Telegram, set one, then send /start again.'
+      );
+      return;
+    }
+
+    let contact = await Contact.findOne({ userId: user.id, telegramChatId: chatId });
+    if (!contact) {
+      contact = await Contact.findOne({ userId: user.id, contact: tgUsername });
+    }
+
+    if (!contact) {
+      contact = new Contact({
+        userId: user.id,
+        name: tgUsername,
+        contact: tgUsername,
+        telegramChatId: chatId,
+        status: 'subscribed',
+        submittedAt: new Date(),
+        subscribedAt: new Date()
+      });
+    } else {
+      contact.name = tgUsername;
+      contact.contact = tgUsername;
+      contact.telegramChatId = chatId;
+      contact.status = 'subscribed';
+      contact.subscribedAt = contact.subscribedAt || new Date();
+      contact.submittedAt = new Date();
+    }
+
+    await contact.save();
+
+    // De-dupe any stale rows for the same person
+    await Contact.deleteMany({
+      userId: user.id,
+      $or: [
+        { contact: tgUsername, _id: { $ne: contact._id } },
+        { telegramChatId: chatId, _id: { $ne: contact._id } }
+      ]
+    });
+
+    invalidateUserCache(user.id, 'contacts');
+
+    await ctx.replyWithHTML(
+      '<b>Subscription Confirmed!</b>\n\nHi <b>@' + escapeHtml(tgUsername) + '</b>!\n\nYou\'re now subscribed.\n\nThank you'
+    );
   });
 
   bot.command('status', async (ctx) => {
@@ -482,20 +470,6 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many attempts' }
-});
-
-const formSubmitLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { error: 'Too many submissions to this form. Please try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: function(req) {
-    return req.ip + '::' + req.params.shortId;
-  },
-  skip: function(req) {
-    return !req.params.shortId;
-  }
 });
 
 // ==================== WEBHOOK ENDPOINT ====================
@@ -1340,7 +1314,11 @@ app.get('/api/forms', authenticateToken, async function(req, res) {
       title: f.title,
       createdAt: f.createdAt,
       updatedAt: f.updatedAt,
-      url: protocol + '://' + host + '/f/' + f.shortId
+      url: protocol + '://' + host + '/f/' + f.shortId,
+      // Every form shares the same single subscribe link: straight to the
+      // bot, no payload, no segmentation. Anyone who /starts the bot is
+      // subscribed to this account directly.
+      subscribeLink: req.user.botUsername ? 'https://t.me/' + req.user.botUsername : null
     };
   });
 
@@ -1360,11 +1338,9 @@ app.get('/api/contacts', authenticateToken, async function(req, res) {
   const contacts = await Contact.find({ userId: req.user.id }).sort({ submittedAt: -1 });
   const formatted = contacts.map(function(c) {
     return {
-      name: c.name,
-      contact: c.contact,
+      username: '@' + c.contact,
       status: c.status,
-      telegramChatId: c.telegramChatId || null,
-      pageId: c.shortId,
+      // telegramChatId intentionally omitted from the dashboard payload
       submittedAt: new Date(c.submittedAt).toLocaleString(),
       subscribedAt: c.subscribedAt ? new Date(c.subscribedAt).toLocaleString() : null
     };
@@ -1532,78 +1508,11 @@ app.post('/api/forms/delete', authenticateToken, async function(req, res) {
   res.json({ success: true });
 });
 
-// ==================== SUBSCRIBE & CONTACTS ====================
-app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) {
-  const shortId = req.params.shortId;
-  const { name, email } = req.body;
-
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
-  if (!email || !email.trim()) return res.status(400).json({ error: 'Contact is required' });
-
-  const contactValue = email.trim();
-
-  if (!CONTACT_REGEX.test(contactValue)) {
-    return res.status(400).json({ error: 'Contact must be a valid email address or phone number' });
-  }
-
-  const form = await FormPage.findOne({ shortId: shortId });
-  if (!form) return res.status(404).json({ error: 'Form not found' });
-
-  const owner = await User.findOne({ id: form.userId });
-  if (!owner || !owner.telegramBotToken || !owner.botUsername) return res.status(400).json({ error: 'Bot not connected' });
-
-  const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
-
-  let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
-
-  if (contact) {
-    if (contact.status === 'subscribed') {
-      contact.name = name.trim();
-      contact.shortId = shortId;
-      contact.submittedAt = new Date();
-      await contact.save();
-
-      pendingSubscribers.set(payload, {
-        userId: owner.id,
-        shortId: shortId,
-        name: name.trim(),
-        contact: contactValue,
-        createdAt: Date.now()
-      });
-
-      const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
-      return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
-    }
-
-    contact.name = name.trim();
-    contact.shortId = shortId;
-    contact.submittedAt = new Date();
-  } else {
-    contact = new Contact({
-      userId: owner.id,
-      shortId: shortId,
-      name: name.trim(),
-      contact: contactValue,
-      status: 'pending',
-      submittedAt: new Date()
-    });
-    await contact.save();
-  }
-
-  pendingSubscribers.set(payload, {
-    userId: owner.id,
-    shortId: shortId,
-    name: name.trim(),
-    contact: contactValue,
-    createdAt: Date.now()
-  });
-
-  const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
-  res.json({ success: true, deepLink: deepLink });
-
-  invalidateUserCache(owner.id, 'contacts');
-});
-
+// ==================== CONTACTS ====================
+// Subscription now happens purely via /start in launchUserBot() above —
+// there is no web form, no name/email, and no per-request payload. Anyone
+// who starts the bot is added as a contact identified by their Telegram
+// @username. The routes below only manage already-collected contacts.
 app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
   const { contacts } = req.body;
   if (!Array.isArray(contacts) || contacts.length === 0) return res.status(400).json({ error: 'Provide contact array' });
@@ -1925,18 +1834,6 @@ app.post('/admin-limits', async function(req, res) {
   }
 });
 
-// ==================== CLEANUP ====================
-setInterval(function() {
-  const now = Date.now();
-  const keys = Array.from(pendingSubscribers.keys());
-  for (const key of keys) {
-    const data = pendingSubscribers.get(key);
-    if (now - data.createdAt > 30 * 60 * 1000) {
-      pendingSubscribers.delete(key);
-    }
-  }
-}, 60 * 60 * 1000);
-
 // ==================== STARTUP ====================
 async function loadAdminSettings() {
   try {
@@ -1992,4 +1889,3 @@ app.listen(PORT, function() {
   console.log('\nSENDEM SERVER — FULL VERSION WITH BullMQ + Redis BROADCAST QUEUE');
   console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
-    
