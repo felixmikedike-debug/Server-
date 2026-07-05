@@ -16,7 +16,7 @@ const { Queue, Worker } = require('bullmq');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-('trust proxy', 3);
+app.set('trust proxy', 3);
 
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
@@ -73,6 +73,9 @@ if (process.env.REDIS_URL) {
 }
 
 const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
+
+// ==================== CONTACT VALIDATION REGEX ====================
+const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
 
 // ==================== PER-USER & PUBLIC CACHE WITH TTL ====================
 const userCache = new Map();
@@ -282,10 +285,23 @@ broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 // In-memory helpers
 const activeBots = new Map();
 const resetTokens = new Map();
+const pendingSubscribers = new Map();
 const lastWebhookSetTime = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
-function launchUserBot(user) {
+// IMPORTANT: this function now returns a Promise that resolves only once
+// the webhook has been confirmed set (or definitively failed). Callers
+// MUST await it before telling the user their bot/deep-link is ready.
+// Previously this ran fire-and-forget, which meant the HTTP response
+// (containing the /start deep link) could reach the user before Telegram's
+// webhook was actually pointed at this server. If the user tapped the
+// deep link during that window, the /start update was lost — activeBots
+// didn't have the bot registered yet, or Telegram was still delivering to
+// the old/deleted webhook — so the bot fell through to generic handling
+// or never fired at all, leaving the contact stuck on "pending" and the
+// bot replying with the fallback welcome text instead of confirming the
+// subscription.
+async function launchUserBot(user) {
   // Remove old bot instance without calling .stop() (not needed in pure webhook mode)
   if (activeBots.has(user.id)) {
     activeBots.delete(user.id);
@@ -310,9 +326,70 @@ function launchUserBot(user) {
   bot.start(async (ctx) => {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
-    const tgUsername = ctx.chat.username || null;
 
-    // 2FA-connect flow for the account owner: /start <userId>
+    if (payload.startsWith('sub_') && pendingSubscribers.has(payload)) {
+      const sub = pendingSubscribers.get(payload);
+      if (sub.userId === user.id) {
+        let targetContact = await Contact.findOne({
+          userId: user.id,
+          telegramChatId: chatId
+        });
+
+        const contactsByEmail = await Contact.find({ userId: user.id, contact: sub.contact });
+
+        if (!targetContact) {
+          targetContact = contactsByEmail.find(c => c.status === 'subscribed') ||
+                          contactsByEmail.find(c => c.shortId === sub.shortId) ||
+                          contactsByEmail[0];
+        }
+
+        if (!targetContact) {
+          targetContact = new Contact({
+            userId: user.id,
+            shortId: sub.shortId,
+            name: sub.name,
+            contact: sub.contact,
+            telegramChatId: chatId,
+            status: 'subscribed',
+            submittedAt: new Date(),
+            subscribedAt: new Date()
+          });
+        } else {
+          targetContact.name = sub.name;
+          targetContact.contact = sub.contact;
+          targetContact.shortId = sub.shortId;
+          targetContact.telegramChatId = chatId;
+          targetContact.status = 'subscribed';
+          targetContact.subscribedAt = targetContact.subscribedAt || new Date();
+          targetContact.submittedAt = new Date();
+        }
+
+        await targetContact.save();
+
+        await Contact.deleteMany({
+          userId: user.id,
+          $or: [
+            { contact: sub.contact, _id: { $ne: targetContact._id } },
+            { telegramChatId: chatId, _id: { $ne: targetContact._id } }
+          ]
+        });
+
+        pendingSubscribers.delete(payload);
+
+        const form = await FormPage.findOne({ shortId: sub.shortId });
+        let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
+
+        if (form && form.welcomeMessage && form.welcomeMessage.trim()) {
+          welcomeText = form.welcomeMessage
+            .replace(/\{name\}/gi, '<b>' + escapeHtml(sub.name) + '</b>')
+            .replace(/\{contact\}/gi, escapeHtml(sub.contact));
+        }
+
+        await ctx.replyWithHTML(welcomeText);
+        return;
+      }
+    }
+
     if (payload === user.id) {
       user.telegramChatId = chatId;
       user.isTelegramConnected = true;
@@ -321,60 +398,7 @@ function launchUserBot(user) {
       return;
     }
 
-    // ---- Simplified subscription flow ----
-    // No payload, no name/email form, no per-form segmentation. This bot
-    // belongs to exactly one account, so anyone who hits /start is simply
-    // subscribed under that account, identified only by their Telegram
-    // @username.
-    if (!tgUsername) {
-      await ctx.replyWithHTML(
-        '<b>Telegram Username Required</b>\n\n' +
-        'You need to set a Telegram username before you can subscribe.\n\n' +
-        'Go to Settings → Edit Profile → Username in Telegram, set one, then send /start again.'
-      );
-      return;
-    }
-
-    let contact = await Contact.findOne({ userId: user.id, telegramChatId: chatId });
-    if (!contact) {
-      contact = await Contact.findOne({ userId: user.id, contact: tgUsername });
-    }
-
-    if (!contact) {
-      contact = new Contact({
-        userId: user.id,
-        name: tgUsername,
-        contact: tgUsername,
-        telegramChatId: chatId,
-        status: 'subscribed',
-        submittedAt: new Date(),
-        subscribedAt: new Date()
-      });
-    } else {
-      contact.name = tgUsername;
-      contact.contact = tgUsername;
-      contact.telegramChatId = chatId;
-      contact.status = 'subscribed';
-      contact.subscribedAt = contact.subscribedAt || new Date();
-      contact.submittedAt = new Date();
-    }
-
-    await contact.save();
-
-    // De-dupe any stale rows for the same person
-    await Contact.deleteMany({
-      userId: user.id,
-      $or: [
-        { contact: tgUsername, _id: { $ne: contact._id } },
-        { telegramChatId: chatId, _id: { $ne: contact._id } }
-      ]
-    });
-
-    invalidateUserCache(user.id, 'contacts');
-
-    await ctx.replyWithHTML(
-      '<b>Subscription Confirmed!</b>\n\nHi <b>@' + escapeHtml(tgUsername) + '</b>!\n\nYou\'re now subscribed.\n\nThank you'
-    );
+    await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
   });
 
   bot.command('status', async (ctx) => {
@@ -384,78 +408,85 @@ function launchUserBot(user) {
   const webhookPath = '/webhook/' + WEBHOOK_SECRET + '/' + user.id;
   const webhookUrl = 'https://' + DOMAIN + webhookPath;
 
-  (async () => {
-    try {
-      const current = await bot.telegram.getWebhookInfo();
+  try {
+    const current = await bot.telegram.getWebhookInfo();
 
-      const alreadyCorrect =
-        current.url === webhookUrl &&
-        !current.has_custom_certificate &&
-        current.pending_update_count < 50;
+    const alreadyCorrect =
+      current.url === webhookUrl &&
+      !current.has_custom_certificate &&
+      current.pending_update_count < 50;
 
-      const lastSet = lastWebhookSetTime.get(user.id) || 0;
-      const recentlySet = Date.now() - lastSet < 30 * 60 * 1000;
+    const lastSet = lastWebhookSetTime.get(user.id) || 0;
+    const recentlySet = Date.now() - lastSet < 30 * 60 * 1000;
 
-      if (alreadyCorrect && recentlySet) {
-        console.log('Webhook already perfect & recent for ' + user.email + ' → skipping');
-        activeBots.set(user.id, bot);
-        return;
-      }
+    if (alreadyCorrect && recentlySet) {
+      console.log('Webhook already perfect & recent for ' + user.email + ' → skipping');
+      activeBots.set(user.id, bot);
+      return;
+    }
 
-      if (alreadyCorrect) {
-        console.log('Webhook correct but old → refreshing timestamp for ' + user.email);
-        lastWebhookSetTime.set(user.id, Date.now());
-        activeBots.set(user.id, bot);
-        return;
-      }
+    if (alreadyCorrect) {
+      console.log('Webhook correct but old → refreshing timestamp for ' + user.email);
+      lastWebhookSetTime.set(user.id, Date.now());
+      activeBots.set(user.id, bot);
+      return;
+    }
 
-      console.log('Webhook needs update for ' + user.email + ' → current: ' + (current.url || 'none'));
+    console.log('Webhook needs update for ' + user.email + ' → current: ' + (current.url || 'none'));
 
-      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-      console.log('Webhook cleaned for ' + user.email);
+    // Register the bot instance BEFORE we touch the webhook. In pure
+    // webhook mode this map entry is what lets incoming updates be
+    // routed at all; there's no reason to make callers/users wait on
+    // deleteWebhook/setWebhook before we're even capable of handling
+    // an update that slips in mid-setup.
+    activeBots.set(user.id, bot);
 
-      await new Promise(resolve => setTimeout(resolve, 4000));
-      await new Promise(resolve => setTimeout(resolve, 2500));
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log('Webhook cleaned for ' + user.email);
 
-      let attempts = 0;
-      const maxAttempts = 5; // Increased attempts for network reliability
+    // Small settle delay after deleteWebhook, as recommended by Telegram
+    // to avoid setWebhook racing the delete on their side.
+    await new Promise(resolve => setTimeout(resolve, 1500));
 
-      while (attempts < maxAttempts) {
-        try {
-          const success = await bot.telegram.setWebhook(webhookUrl, {
-            allowed_updates: ['message', 'callback_query', 'my_chat_member']
-          });
+    let attempts = 0;
+    const maxAttempts = 5;
 
-          if (success) {
-            console.log('Webhook SUCCESSFULLY set for @' + (user.botUsername || 'unknown') + ' → ' + webhookUrl);
-            lastWebhookSetTime.set(user.id, Date.now());
-            activeBots.set(user.id, bot);
-            return;
+    while (attempts < maxAttempts) {
+      try {
+        const success = await bot.telegram.setWebhook(webhookUrl, {
+          allowed_updates: ['message', 'callback_query', 'my_chat_member']
+        });
+
+        if (success) {
+          console.log('Webhook SUCCESSFULLY set for @' + (user.botUsername || 'unknown') + ' → ' + webhookUrl);
+          lastWebhookSetTime.set(user.id, Date.now());
+          return;
+        }
+      } catch (err) {
+        attempts++;
+        if (err.response && err.response.error_code === 429) {
+          const retryAfter = err.response.parameters?.retry_after || 30;
+          console.warn('Rate limit hit for ' + user.email + ' - waiting ' + (retryAfter + 5) + 's (attempt ' + attempts + '/' + maxAttempts + ')');
+          await new Promise(r => setTimeout(r, (retryAfter + 5) * 1000));
+        } else {
+          console.error('Webhook set FAILED for ' + user.email + ': ' + err.message);
+          if (attempts >= maxAttempts) {
+            throw err;
           }
-        } catch (err) {
-          attempts++;
-          if (err.response && err.response.error_code === 429) {
-            const retryAfter = err.response.parameters?.retry_after || 30;
-            console.warn('Rate limit hit for ' + user.email + ' - waiting ' + (retryAfter + 5) + 's (attempt ' + attempts + '/' + maxAttempts + ')');
-            await new Promise(r => setTimeout(r, (retryAfter + 5) * 1000));
-          } else {
-            console.error('Webhook set FAILED for ' + user.email + ': ' + err.message);
-            if (attempts >= maxAttempts) {
-              throw err;
-            }
-            await new Promise(r => setTimeout(r, 5000)); // Extra delay on failure
-          }
+          await new Promise(r => setTimeout(r, 5000));
         }
       }
-
-      console.error('Gave up setting webhook for ' + user.email + ' after ' + maxAttempts + ' attempts');
-    } catch (err) {
-      console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
-    } finally {
-      // Always register the bot instance even if webhook failed (it can still handle incoming updates)
-      activeBots.set(user.id, bot);
     }
-  })();
+
+    console.error('Gave up setting webhook for ' + user.email + ' after ' + maxAttempts + ' attempts');
+  } catch (err) {
+    console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
+  } finally {
+    // Always ensure the bot instance is registered even if webhook setup
+    // failed partway — it can still handle updates if Telegram is somehow
+    // already pointed at us (e.g. a manual setWebhook done out of band).
+    activeBots.set(user.id, bot);
+  }
 }
 
 // ==================== MIDDLEWARE ====================
@@ -470,6 +501,20 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many attempts' }
+});
+
+const formSubmitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many submissions to this form. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: function(req) {
+    return req.ip + '::' + req.params.shortId;
+  },
+  skip: function(req) {
+    return !req.params.shortId;
+  }
 });
 
 // ==================== WEBHOOK ENDPOINT ====================
@@ -497,6 +542,8 @@ app.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async (req, res) => {
     } catch (err) {
       console.error('Webhook handle error for user ' + userId + ':', err);
     }
+  } else {
+    console.warn('Received webhook update for user ' + userId + ' but no active bot is registered yet.');
   }
 
   res.sendStatus(200);
@@ -940,7 +987,16 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
   req.user.telegramChatId = null;
   await req.user.save();
 
-  launchUserBot(req.user);
+  // AWAIT this. Previously fire-and-forget, which meant the deep link
+  // below could be handed to the user and clicked before the webhook
+  // was actually pointed at this server — the root cause of new bots
+  // silently failing to confirm subscriptions.
+  try {
+    await launchUserBot(req.user);
+  } catch (err) {
+    console.error('launchUserBot failed during connect-telegram for ' + req.user.email + ':', err.message);
+    return res.status(500).json({ error: 'Bot connected but webhook setup failed. Please try again.' });
+  }
 
   const startLink = 'https://t.me/' + botUsername + '?start=' + req.user.id;
 
@@ -1012,7 +1068,13 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
   req.user.telegramChatId = null;
   await req.user.save();
 
-  launchUserBot(req.user);
+  // AWAIT this for the same reason as connect-telegram above.
+  try {
+    await launchUserBot(req.user);
+  } catch (err) {
+    console.error('launchUserBot failed during change-bot-token for ' + req.user.email + ':', err.message);
+    return res.status(500).json({ error: 'Bot token updated but webhook setup failed. Please try again.' });
+  }
 
   const startLink = 'https://t.me/' + botUsername + '?start=' + req.user.id;
 
@@ -1266,13 +1328,7 @@ app.get('/f/:shortId', async function(req, res) {
   const form = await FormPage.findOne({ shortId: req.params.shortId });
   if (!form) return res.status(404).render('404');
 
-  const owner = await User.findOne({ id: form.userId }, { botUsername: 1 });
-
-  const data = {
-    title: form.title,
-    state: form.state,
-    subscribeLink: owner && owner.botUsername ? 'https://t.me/' + owner.botUsername : null
-  };
+  const data = { title: form.title, state: form.state };
   publicCache.set(key, { data: data, timestamp: Date.now() });
   res.render('form', data);
 });
@@ -1320,11 +1376,7 @@ app.get('/api/forms', authenticateToken, async function(req, res) {
       title: f.title,
       createdAt: f.createdAt,
       updatedAt: f.updatedAt,
-      url: protocol + '://' + host + '/f/' + f.shortId,
-      // Every form shares the same single subscribe link: straight to the
-      // bot, no payload, no segmentation. Anyone who /starts the bot is
-      // subscribed to this account directly.
-      subscribeLink: req.user.botUsername ? 'https://t.me/' + req.user.botUsername : null
+      url: protocol + '://' + host + '/f/' + f.shortId
     };
   });
 
@@ -1344,9 +1396,11 @@ app.get('/api/contacts', authenticateToken, async function(req, res) {
   const contacts = await Contact.find({ userId: req.user.id }).sort({ submittedAt: -1 });
   const formatted = contacts.map(function(c) {
     return {
-      username: '@' + c.contact,
+      name: c.name,
+      contact: c.contact,
       status: c.status,
-      // telegramChatId intentionally omitted from the dashboard payload
+      telegramChatId: c.telegramChatId || null,
+      pageId: c.shortId,
       submittedAt: new Date(c.submittedAt).toLocaleString(),
       subscribedAt: c.subscribedAt ? new Date(c.subscribedAt).toLocaleString() : null
     };
@@ -1514,11 +1568,78 @@ app.post('/api/forms/delete', authenticateToken, async function(req, res) {
   res.json({ success: true });
 });
 
-// ==================== CONTACTS ====================
-// Subscription now happens purely via /start in launchUserBot() above —
-// there is no web form, no name/email, and no per-request payload. Anyone
-// who starts the bot is added as a contact identified by their Telegram
-// @username. The routes below only manage already-collected contacts.
+// ==================== SUBSCRIBE & CONTACTS ====================
+app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) {
+  const shortId = req.params.shortId;
+  const { name, email } = req.body;
+
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+  if (!email || !email.trim()) return res.status(400).json({ error: 'Contact is required' });
+
+  const contactValue = email.trim();
+
+  if (!CONTACT_REGEX.test(contactValue)) {
+    return res.status(400).json({ error: 'Contact must be a valid email address or phone number' });
+  }
+
+  const form = await FormPage.findOne({ shortId: shortId });
+  if (!form) return res.status(404).json({ error: 'Form not found' });
+
+  const owner = await User.findOne({ id: form.userId });
+  if (!owner || !owner.telegramBotToken || !owner.botUsername) return res.status(400).json({ error: 'Bot not connected' });
+
+  const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
+
+  let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
+
+  if (contact) {
+    if (contact.status === 'subscribed') {
+      contact.name = name.trim();
+      contact.shortId = shortId;
+      contact.submittedAt = new Date();
+      await contact.save();
+
+      pendingSubscribers.set(payload, {
+        userId: owner.id,
+        shortId: shortId,
+        name: name.trim(),
+        contact: contactValue,
+        createdAt: Date.now()
+      });
+
+      const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
+      return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
+    }
+
+    contact.name = name.trim();
+    contact.shortId = shortId;
+    contact.submittedAt = new Date();
+  } else {
+    contact = new Contact({
+      userId: owner.id,
+      shortId: shortId,
+      name: name.trim(),
+      contact: contactValue,
+      status: 'pending',
+      submittedAt: new Date()
+    });
+    await contact.save();
+  }
+
+  pendingSubscribers.set(payload, {
+    userId: owner.id,
+    shortId: shortId,
+    name: name.trim(),
+    contact: contactValue,
+    createdAt: Date.now()
+  });
+
+  const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
+  res.json({ success: true, deepLink: deepLink });
+
+  invalidateUserCache(owner.id, 'contacts');
+});
+
 app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
   const { contacts } = req.body;
   if (!Array.isArray(contacts) || contacts.length === 0) return res.status(400).json({ error: 'Provide contact array' });
@@ -1840,6 +1961,18 @@ app.post('/admin-limits', async function(req, res) {
   }
 });
 
+// ==================== CLEANUP ====================
+setInterval(function() {
+  const now = Date.now();
+  const keys = Array.from(pendingSubscribers.keys());
+  for (const key of keys) {
+    const data = pendingSubscribers.get(key);
+    if (now - data.createdAt > 30 * 60 * 1000) {
+      pendingSubscribers.delete(key);
+    }
+  }
+}, 60 * 60 * 1000);
+
 // ==================== STARTUP ====================
 async function loadAdminSettings() {
   try {
@@ -1860,7 +1993,11 @@ mongoose.connection.once('open', async function() {
 
   const usersWithBots = await User.find({ telegramBotToken: { $exists: true, $ne: null } });
   for (const user of usersWithBots) {
-    launchUserBot(user);
+    try {
+      await launchUserBot(user);
+    } catch (err) {
+      console.error('Failed to launch bot at startup for ' + user.email + ':', err.message);
+    }
   }
   console.log('Launched ' + usersWithBots.length + ' bots in pure webhook mode');
 
