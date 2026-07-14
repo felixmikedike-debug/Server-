@@ -969,6 +969,9 @@ app.get('/api/auth/me', authenticateToken, function(req, res) {
 // Connect 2FA: just a deep link into the SHARED auth bot. No token entry
 // or validation needed since there's nothing per-user to configure.
 app.get('/api/auth/connect-telegram-link', authenticateToken, function(req, res) {
+  if (!serverReady || !botPool.authBot) {
+    return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
+  }
   const startLink = 'https://t.me/' + botPool.authBot.username + '?start=' + req.user.id;
   res.json({ success: true, startLink: startLink, botUsername: '@' + botPool.authBot.username });
 });
