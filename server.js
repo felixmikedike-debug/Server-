@@ -17,7 +17,7 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-const BUILD_TAG = 'botpool-readiness-guard-2026-07-14';
+const BUILD_TAG = 'simple-computed-bot-assignment-2026-07-14';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
@@ -124,19 +124,14 @@ const contactSchema = new mongoose.Schema({
   userId: { type: String, required: true },       // the Sendm creator who owns this subscriber
   shortId: String,                                  // which form they subscribed via
   name: String,
-  contact: { type: String, required: true },        // email or phone, used for sharding + identity
+  contact: { type: String, required: true },        // email or phone, used for bot assignment + identity
   telegramChatId: String,
   // Telegram @username, captured at /start confirm time (ctx.from.username).
   // Optional field on Telegram's side — many users won't have one, so this
   // can be null. Convenience/display only; never used for identity or
-  // sharding (telegramChatId + contact remain the real identity anchors),
-  // since usernames can change at any time.
+  // bot assignment (telegramChatId + contact remain the real identity
+  // anchors), since usernames can change at any time.
   telegramUsername: String,
-  // Deterministic shard assignment: md5(contact) % poolSize, stored as a
-  // string index. Set once at first subscribe, never recalculated (see
-  // computeBotKey / getBroadcastBot below) so a contact always talks to
-  // the same broadcast bot going forward.
-  botKey: { type: String, required: true },
   status: { type: String, default: 'pending' },
   submittedAt: Date,
   subscribedAt: Date,
@@ -153,7 +148,6 @@ const pendingSubscriberSchema = new mongoose.Schema({
   shortId: String,
   name: String,
   contact: { type: String, required: true },
-  botKey: { type: String, required: true },
   createdAt: { type: Date, default: Date.now, expires: 1800 } // 30 min TTL
 });
 
@@ -204,7 +198,7 @@ const BroadcastDaily = mongoose.model('BroadcastDaily', broadcastDailySchema);
 contactSchema.index({ userId: 1 });
 contactSchema.index({ userId: 1, contact: 1 });
 contactSchema.index({ userId: 1, status: 1 });
-contactSchema.index({ botKey: 1, status: 1 }); // broadcast worker fans out by botKey
+contactSchema.index({ status: 1 }); // broadcast worker fans out by status
 landingPageSchema.index({ userId: 1 });
 formPageSchema.index({ userId: 1 });
 scheduledBroadcastSchema.index({ userId: 1 });
@@ -276,17 +270,20 @@ let adminSettingsCache = { dailyBroadcastLimit: 3, maxLandingPages: 5, maxForms:
  *   Configured via BROADCAST_BOT_TOKENS (comma-separated). Add more
  *   tokens to that env var any time to scale out — no code changes.
  *
- * Sharding: every Contact is deterministically assigned to exactly one
- * broadcast bot via md5(contact) % N, stored as `botKey` (a string
- * index, e.g. "0", "1", "2"). This keeps a given subscriber talking to
- * the same bot forever (needed because Telegram chat state is tied to
- * whichever bot the user pressed /start on).
+ * Bot assignment: SIMPLE DESIGN. Nothing is stored on the Contact/
+ * PendingSubscriber documents. Every time we need to know which bot a
+ * contact talks to, we compute it fresh: md5(contact) % poolSize. Same
+ * contact + same pool size always gives the same bot, so a subscriber
+ * consistently lands on the same bot without us ever persisting or
+ * validating a stale index. This removes the whole class of "botKey is
+ * undefined/stale/out of range" bugs the stored-key version had.
  *
- * IMPORTANT CAVEAT: mod-based sharding is stable for a FIXED bot count.
- * If you shrink the pool (remove tokens), old botKey values can point
- * past the new array bounds — getBroadcastBot() wraps defensively, but
- * if you need reshardable-on-resize behavior later, migrate to
- * consistent hashing. Not needed at 3-4 bots.
+ * CAVEAT: if you resize the pool (add/remove BROADCAST_BOT_TOKENS)
+ * while someone is mid-flow (subscribed but hasn't clicked the Telegram
+ * link yet), they could get a different bot at confirm time than at
+ * subscribe time. Low-stakes at this scale — just avoid resizing the
+ * pool during a big active campaign, and existing SUBSCRIBED contacts
+ * are unaffected since sends look up telegramChatId directly.
  */
 const botPool = {
   authBot: null,
@@ -296,26 +293,15 @@ const botPool = {
     return this.broadcastBots.length;
   },
 
-  computeBotKey(contactValue) {
-    if (this.poolSize === 0) {
-      throw new Error('Bot pool is empty (poolSize=0) — cannot compute botKey. The broadcast bot pool has not finished initializing.');
-    }
-    const hash = crypto.createHash('md5').update(contactValue.toLowerCase().trim()).digest('hex');
+  // Returns the { bot, index, token, username } entry this contact
+  // should use, computed fresh — never throws on empty pool, returns
+  // null instead so callers can give a clean "try again" response.
+  getBotForContact(contactValue) {
+    if (this.poolSize === 0) return null;
+    const hash = crypto.createHash('md5').update(String(contactValue).toLowerCase().trim()).digest('hex');
     const n = parseInt(hash.slice(0, 8), 16);
-    return String(n % this.poolSize);
-  },
-
-  getBroadcastBot(botKey) {
-    if (this.poolSize === 0) {
-      throw new Error('Bot pool is empty (poolSize=0) — cannot resolve broadcast bot. The broadcast bot pool has not finished initializing.');
-    }
-    let idx = parseInt(botKey, 10);
-    if (isNaN(idx) || idx < 0) idx = 0;
-    if (idx >= this.poolSize) {
-      console.warn('botKey ' + botKey + ' is out of range for current pool size ' + this.poolSize + ' — wrapping. Consider a resharding pass.');
-      idx = idx % this.poolSize;
-    }
-    return this.broadcastBots[idx];
+    const idx = n % this.poolSize;
+    return this.broadcastBots[idx] || null;
   },
 
   getBroadcastBotByIndex(index) {
@@ -627,25 +613,9 @@ function registerBroadcastBotHandlers(bot, botIndex) {
       return;
     }
 
-    // Defensive: this payload should only ever arrive at the bot it was
-    // sharded to, but double-check in case of a misconfigured deep link
-    // or a pool resize between subscribe-time and confirm-time.
-    if (parseInt(pending.botKey, 10) !== botIndex) {
-      console.warn('Payload ' + payload + ' arrived at bot[' + botIndex + '] but was sharded to botKey ' + pending.botKey + '. Proceeding anyway (pool may have resized).');
-    }
-
-    if (!pending.botKey) {
-      // Should be structurally unreachable (botKey is required on
-      // PendingSubscriber too), but never let an undefined botKey reach
-      // Contact.save() and blow up as an unhandled ValidationError.
-      console.error('PendingSubscriber ' + payload + ' has no botKey — refusing to create/update Contact.');
-      await ctx.replyWithHTML(
-        '<b>Something went wrong confirming your subscription.</b>\n\n' +
-        'Please go back to the page and submit the form again.'
-      );
-      await PendingSubscriber.deleteOne({ payload: payload }).catch(function() {});
-      return;
-    }
+    // Note: with the simple design, whichever bot this /start lands on
+    // IS the bot this contact will use going forward — we just record
+    // telegramChatId, no separate shard-key bookkeeping needed.
 
     let targetContact = await Contact.findOne({ userId: pending.userId, telegramChatId: chatId });
     const contactsByValue = await Contact.find({ userId: pending.userId, contact: pending.contact });
@@ -664,7 +634,6 @@ function registerBroadcastBotHandlers(bot, botIndex) {
         contact: pending.contact,
         telegramChatId: chatId,
         telegramUsername: tgUsername,
-        botKey: pending.botKey,
         status: 'subscribed',
         submittedAt: new Date(),
         subscribedAt: new Date()
@@ -675,7 +644,6 @@ function registerBroadcastBotHandlers(bot, botIndex) {
       targetContact.shortId = pending.shortId;
       targetContact.telegramChatId = chatId;
       targetContact.telegramUsername = tgUsername;
-      targetContact.botKey = pending.botKey;
       targetContact.status = 'subscribed';
       targetContact.subscribedAt = targetContact.subscribedAt || new Date();
       targetContact.submittedAt = new Date();
@@ -716,12 +684,13 @@ function registerBroadcastBotHandlers(bot, botIndex) {
 
 // ==================== BROADCAST WORKER ====================
 /**
- * Sends `chunks` to a single contact using the bot the contact is
- * sharded to (via contact.botKey).
+ * Sends `chunks` to a single contact. Which bot to use is computed
+ * fresh from the contact's identity value — nothing stored, nothing
+ * that can go stale.
  */
 async function sendToContact(contact, chunks) {
-  const entry = botPool.getBroadcastBot(contact.botKey);
-  if (!entry) throw new Error('No broadcast bot available for botKey ' + contact.botKey);
+  const entry = botPool.getBotForContact(contact.contact);
+  if (!entry) throw new Error('No broadcast bot available (pool empty) for contact ' + contact.contact);
   for (const chunk of chunks) {
     await entry.bot.telegram.sendMessage(contact.telegramChatId, chunk, { parse_mode: 'HTML' });
   }
@@ -1441,30 +1410,17 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
     const owner = await User.findOne({ id: form.userId });
     if (!owner) return res.status(400).json({ error: 'Form owner not found' });
 
-    // Deterministic shard assignment — the whole point of the pool model.
-    // Computed fresh for never-before-seen contacts; existing contacts
-    // reuse their stored botKey below instead of recomputing, so they
-    // always land back on the same bot.
-    const computedBotKey = botPool.computeBotKey(contactValue);
+    // Which broadcast bot handles this contact is computed fresh, right
+    // here, every time — nothing stored, nothing that can go stale.
+    const broadcastBotEntry = botPool.getBotForContact(contactValue);
+    if (!broadcastBotEntry) {
+      console.error('No broadcast bot available (pool empty) for contact ' + contactValue + ' (owner ' + owner.id + ')');
+      return res.status(503).json({ error: 'Unable to assign a broadcast bot right now. Please try again shortly.' });
+    }
 
     const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
 
     let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
-    const botKey = contact ? contact.botKey : computedBotKey;
-
-    if (!botKey) {
-      // Should be structurally unreachable now (computeBotKey throws on
-      // empty pool, and existing contacts always have a required botKey),
-      // but guard it anyway so we NEVER pass undefined into Contact.save().
-      console.error('botKey resolved to falsy value for contact ' + contactValue + ' (owner ' + owner.id + ')');
-      return res.status(503).json({ error: 'Unable to assign a broadcast bot right now. Please try again shortly.' });
-    }
-
-    const broadcastBotEntry = botPool.getBroadcastBot(botKey);
-    if (!broadcastBotEntry) {
-      console.error('No broadcast bot entry resolved for botKey ' + botKey);
-      return res.status(503).json({ error: 'Unable to assign a broadcast bot right now. Please try again shortly.' });
-    }
 
     if (contact) {
       if (contact.status === 'subscribed') {
@@ -1473,7 +1429,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
         contact.submittedAt = new Date();
         await contact.save();
 
-        await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue, botKey });
+        await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue });
 
         const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
         return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
@@ -1482,7 +1438,6 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
       contact.name = name.trim();
       contact.shortId = shortId;
       contact.submittedAt = new Date();
-      contact.botKey = botKey;
     } else {
       contact = new Contact({
         userId: owner.id,
@@ -1490,13 +1445,12 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
         name: name.trim(),
         contact: contactValue,
         status: 'pending',
-        submittedAt: new Date(),
-        botKey: botKey
+        submittedAt: new Date()
       });
     }
     await contact.save();
 
-    await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue, botKey });
+    await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue });
 
     const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
     res.json({ success: true, deepLink: deepLink });
