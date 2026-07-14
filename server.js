@@ -18,6 +18,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 3);
 
+// Flips to true only after Mongo is connected AND the bot pool has
+// finished initializing (all bots verified via getMe + webhooks set).
+// /ping reports this, and subscribe/broadcast routes refuse to run
+// against a half-initialized pool instead of crashing on undefined bots.
+let serverReady = false;
+
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_fallback_change_me';
@@ -1387,6 +1393,10 @@ app.post('/api/forms/delete', authenticateToken, async function(req, res) {
 
 // ==================== SUBSCRIBE & CONTACTS ====================
 app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) {
+  if (!serverReady || botPool.poolSize === 0) {
+    return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
+  }
+
   const shortId = req.params.shortId;
   const { name, email } = req.body;
 
@@ -1468,6 +1478,10 @@ app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
 
 // ==================== BROADCASTING ====================
 app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
+  if (!serverReady || botPool.poolSize === 0) {
+    return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
+  }
+
   const { message } = req.body;
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
@@ -1503,6 +1517,10 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
 });
 
 app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) {
+  if (!serverReady || botPool.poolSize === 0) {
+    return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
+  }
+
   const { message, scheduledTime, recipients = 'all' } = req.body;
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
@@ -1782,21 +1800,32 @@ async function loadAdminSettings() {
 }
 
 mongoose.connection.once('open', async function() {
-  await loadAdminSettings();
+  try {
+    await loadAdminSettings();
 
-  // Bot pool: init once, register handlers once, set webhooks once.
-  // No more per-user bot lifecycle — this happens exactly once at boot
-  // regardless of how many Sendm users/contacts exist.
-  await initBotPool();
-  registerAuthBotHandlers(botPool.authBot);
-  botPool.broadcastBots.forEach(function(entry) {
-    registerBroadcastBotHandlers(entry.bot, entry.index);
-  });
-  await setupAllWebhooks();
+    // Bot pool: init once, register handlers once, set webhooks once.
+    // No more per-user bot lifecycle — this happens exactly once at boot
+    // regardless of how many Sendm users/contacts exist.
+    await initBotPool();
+    registerAuthBotHandlers(botPool.authBot);
+    botPool.broadcastBots.forEach(function(entry) {
+      registerBroadcastBotHandlers(entry.bot, entry.index);
+    });
+    await setupAllWebhooks();
 
-  await recoverLostScheduledBroadcasts();
+    await recoverLostScheduledBroadcasts();
 
-  console.log('Startup sequence completed');
+    serverReady = true;
+    console.log('Startup sequence completed — server is now accepting bot-dependent requests');
+  } catch (err) {
+    // Do NOT let the process limp along with an empty bot pool — that's
+    // what caused subscribes to fail with confusing Mongoose/undefined
+    // errors while the server looked "up" from the outside. Fail loud so
+    // Render restarts/reports the deploy as broken instead of routing
+    // real traffic to a half-initialized instance.
+    console.error('FATAL: startup sequence failed, exiting:', err.message);
+    process.exit(1);
+  }
 });
 
 process.on('SIGTERM', async function() {
@@ -1814,6 +1843,7 @@ process.on('SIGINT', async function() {
 });
 
 app.get('/ping', function(req, res) {
+  if (!serverReady) return res.status(503).type('text/plain').send('starting up');
   res.status(200).type('text/plain').send('ok');
 });
 
