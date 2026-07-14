@@ -14,7 +14,13 @@ const crypto = require('crypto');
 const IORedis = require('ioredis');
 const { Queue, Worker } = require('bullmq');
 
+// Bump this string any time you deploy a fix and want an unambiguous way
+// to confirm from the OUTSIDE (via /ping or the boot logs) that the
+// server actually running is the version you think it is.
+const BUILD_TAG = 'botpool-readiness-guard-2026-07-14';
+
 const app = express();
+console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
 const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 3);
 
@@ -291,12 +297,18 @@ const botPool = {
   },
 
   computeBotKey(contactValue) {
+    if (this.poolSize === 0) {
+      throw new Error('Bot pool is empty (poolSize=0) — cannot compute botKey. The broadcast bot pool has not finished initializing.');
+    }
     const hash = crypto.createHash('md5').update(contactValue.toLowerCase().trim()).digest('hex');
     const n = parseInt(hash.slice(0, 8), 16);
     return String(n % this.poolSize);
   },
 
   getBroadcastBot(botKey) {
+    if (this.poolSize === 0) {
+      throw new Error('Bot pool is empty (poolSize=0) — cannot resolve broadcast bot. The broadcast bot pool has not finished initializing.');
+    }
     let idx = parseInt(botKey, 10);
     if (isNaN(idx) || idx < 0) idx = 0;
     if (idx >= this.poolSize) {
@@ -620,6 +632,19 @@ function registerBroadcastBotHandlers(bot, botIndex) {
     // or a pool resize between subscribe-time and confirm-time.
     if (parseInt(pending.botKey, 10) !== botIndex) {
       console.warn('Payload ' + payload + ' arrived at bot[' + botIndex + '] but was sharded to botKey ' + pending.botKey + '. Proceeding anyway (pool may have resized).');
+    }
+
+    if (!pending.botKey) {
+      // Should be structurally unreachable (botKey is required on
+      // PendingSubscriber too), but never let an undefined botKey reach
+      // Contact.save() and blow up as an unhandled ValidationError.
+      console.error('PendingSubscriber ' + payload + ' has no botKey — refusing to create/update Contact.');
+      await ctx.replyWithHTML(
+        '<b>Something went wrong confirming your subscription.</b>\n\n' +
+        'Please go back to the page and submit the form again.'
+      );
+      await PendingSubscriber.deleteOne({ payload: payload }).catch(function() {});
+      return;
     }
 
     let targetContact = await Contact.findOne({ userId: pending.userId, telegramChatId: chatId });
@@ -1397,72 +1422,90 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
     return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
   }
 
-  const shortId = req.params.shortId;
-  const { name, email } = req.body;
+  try {
+    const shortId = req.params.shortId;
+    const { name, email } = req.body;
 
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
-  if (!email || !email.trim()) return res.status(400).json({ error: 'Contact is required' });
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+    if (!email || !email.trim()) return res.status(400).json({ error: 'Contact is required' });
 
-  const contactValue = email.trim();
+    const contactValue = email.trim();
 
-  if (!CONTACT_REGEX.test(contactValue)) {
-    return res.status(400).json({ error: 'Contact must be a valid email address or phone number' });
-  }
+    if (!CONTACT_REGEX.test(contactValue)) {
+      return res.status(400).json({ error: 'Contact must be a valid email address or phone number' });
+    }
 
-  const form = await FormPage.findOne({ shortId: shortId });
-  if (!form) return res.status(404).json({ error: 'Form not found' });
+    const form = await FormPage.findOne({ shortId: shortId });
+    if (!form) return res.status(404).json({ error: 'Form not found' });
 
-  const owner = await User.findOne({ id: form.userId });
-  if (!owner) return res.status(400).json({ error: 'Form owner not found' });
+    const owner = await User.findOne({ id: form.userId });
+    if (!owner) return res.status(400).json({ error: 'Form owner not found' });
 
-  // Deterministic shard assignment — the whole point of the pool model.
-  // Computed fresh for never-before-seen contacts; existing contacts
-  // reuse their stored botKey below instead of recomputing, so they
-  // always land back on the same bot.
-  const computedBotKey = botPool.computeBotKey(contactValue);
+    // Deterministic shard assignment — the whole point of the pool model.
+    // Computed fresh for never-before-seen contacts; existing contacts
+    // reuse their stored botKey below instead of recomputing, so they
+    // always land back on the same bot.
+    const computedBotKey = botPool.computeBotKey(contactValue);
 
-  const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
+    const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
 
-  let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
-  const botKey = contact ? contact.botKey : computedBotKey;
-  const broadcastBotEntry = botPool.getBroadcastBot(botKey);
+    let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
+    const botKey = contact ? contact.botKey : computedBotKey;
 
-  if (contact) {
-    if (contact.status === 'subscribed') {
+    if (!botKey) {
+      // Should be structurally unreachable now (computeBotKey throws on
+      // empty pool, and existing contacts always have a required botKey),
+      // but guard it anyway so we NEVER pass undefined into Contact.save().
+      console.error('botKey resolved to falsy value for contact ' + contactValue + ' (owner ' + owner.id + ')');
+      return res.status(503).json({ error: 'Unable to assign a broadcast bot right now. Please try again shortly.' });
+    }
+
+    const broadcastBotEntry = botPool.getBroadcastBot(botKey);
+    if (!broadcastBotEntry) {
+      console.error('No broadcast bot entry resolved for botKey ' + botKey);
+      return res.status(503).json({ error: 'Unable to assign a broadcast bot right now. Please try again shortly.' });
+    }
+
+    if (contact) {
+      if (contact.status === 'subscribed') {
+        contact.name = name.trim();
+        contact.shortId = shortId;
+        contact.submittedAt = new Date();
+        await contact.save();
+
+        await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue, botKey });
+
+        const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
+        return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
+      }
+
       contact.name = name.trim();
       contact.shortId = shortId;
       contact.submittedAt = new Date();
-      await contact.save();
-
-      await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue, botKey });
-
-      const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
-      return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
+      contact.botKey = botKey;
+    } else {
+      contact = new Contact({
+        userId: owner.id,
+        shortId: shortId,
+        name: name.trim(),
+        contact: contactValue,
+        status: 'pending',
+        submittedAt: new Date(),
+        botKey: botKey
+      });
     }
+    await contact.save();
 
-    contact.name = name.trim();
-    contact.shortId = shortId;
-    contact.submittedAt = new Date();
-    contact.botKey = botKey;
-  } else {
-    contact = new Contact({
-      userId: owner.id,
-      shortId: shortId,
-      name: name.trim(),
-      contact: contactValue,
-      status: 'pending',
-      submittedAt: new Date(),
-      botKey: botKey
-    });
+    await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue, botKey });
+
+    const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
+    res.json({ success: true, deepLink: deepLink });
+
+    invalidateUserCache(owner.id, 'contacts');
+  } catch (err) {
+    console.error('Subscribe error for shortId ' + req.params.shortId + ': ' + err.message);
+    res.status(500).json({ error: 'Something went wrong while subscribing. Please try again.' });
   }
-  await contact.save();
-
-  await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue, botKey });
-
-  const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
-  res.json({ success: true, deepLink: deepLink });
-
-  invalidateUserCache(owner.id, 'contacts');
 });
 
 app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
@@ -1843,8 +1886,8 @@ process.on('SIGINT', async function() {
 });
 
 app.get('/ping', function(req, res) {
-  if (!serverReady) return res.status(503).type('text/plain').send('starting up');
-  res.status(200).type('text/plain').send('ok');
+  if (!serverReady) return res.status(503).type('text/plain').send('starting up [' + BUILD_TAG + ']');
+  res.status(200).type('text/plain').send('ok [' + BUILD_TAG + ']');
 });
 
 app.use(function(req, res) {
