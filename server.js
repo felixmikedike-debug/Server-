@@ -20,12 +20,22 @@ const { Queue, Worker } = require('bullmq');
 //
 // IMPORTANT: if /ping does not show THIS tag after you deploy, Render is
 // serving stale code and nothing below will matter until that's fixed.
-const BUILD_TAG = 'auth-bot-decoupled-readiness-2026-07-15';
+const BUILD_TAG = 'response-header-proof-2026-07-15-v2';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
 const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 3);
+
+// Stamp EVERY response with the build tag, no exceptions. This makes it
+// impossible to be unsure whether a stale deploy is the problem: open
+// dev tools -> Network tab -> any request -> Response Headers ->
+// X-Sendm-Build. If that value isn't the tag below, Render is not
+// running this file, full stop, regardless of what any route returns.
+app.use(function(req, res, next) {
+  res.setHeader('X-Sendm-Build', BUILD_TAG);
+  next();
+});
 
 // Two SEPARATE readiness flags. This is the key fix in this version:
 // auth (login/2FA) must never be blocked by the broadcast bot pool.
@@ -982,11 +992,15 @@ app.get('/api/auth/me', authenticateToken, function(req, res) {
 // serverReady (which also waits on the entire broadcast pool). A bad
 // or slow BROADCAST_BOT_TOKENS entry must never be able to break login.
 app.get('/api/auth/connect-telegram-link', authenticateToken, function(req, res) {
-  if (!authBotReady || !botPool.authBot) {
-    return res.status(503).json({ error: 'Auth bot is still starting up. Please try again in a few seconds.' });
+  const bot = botPool.authBot;
+  if (!bot || !bot.username) {
+    return res.status(503).json({ error: 'Auth bot not ready yet, try again shortly.' });
   }
-  const startLink = 'https://t.me/' + botPool.authBot.username + '?start=' + req.user.id;
-  res.json({ success: true, startLink: startLink, botUsername: '@' + botPool.authBot.username });
+  return res.json({
+    success: true,
+    startLink: 'https://t.me/' + bot.username + '?start=' + req.user.id,
+    botUsername: '@' + bot.username
+  });
 });
 
 app.post('/api/auth/disconnect-telegram', authenticateToken, async function(req, res) {
