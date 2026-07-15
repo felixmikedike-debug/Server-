@@ -17,18 +17,22 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-const BUILD_TAG = 'simple-computed-bot-assignment-2026-07-14';
+//
+// IMPORTANT: if /ping does not show THIS tag after you deploy, Render is
+// serving stale code and nothing below will matter until that's fixed.
+const BUILD_TAG = 'auth-bot-decoupled-readiness-2026-07-15';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
 const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 3);
 
-// Flips to true only after Mongo is connected AND the bot pool has
-// finished initializing (all bots verified via getMe + webhooks set).
-// /ping reports this, and subscribe/broadcast routes refuse to run
-// against a half-initialized pool instead of crashing on undefined bots.
-let serverReady = false;
+// Two SEPARATE readiness flags. This is the key fix in this version:
+// auth (login/2FA) must never be blocked by the broadcast bot pool.
+// A bad/slow/rate-limited BROADCAST_BOT_TOKENS entry should not be able
+// to 503 the auth-connect route — they are unrelated subsystems.
+let authBotReady = false;   // true once the auth bot + its webhook are up
+let serverReady = false;    // true once auth bot AND broadcast pool are both up
 
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
@@ -266,6 +270,8 @@ let adminSettingsCache = { dailyBroadcastLimit: 3, maxLandingPages: 5, maxForms:
  * Shared platform-owned bot pool.
  *
  * - ONE auth bot: handles 2FA/login codes only. Dedicated token.
+ *   Boots and becomes ready INDEPENDENTLY of the broadcast pool — see
+ *   initAuthBot() / authBotReady below.
  * - N broadcast bots: shared workhorses that deliver subscriber content.
  *   Configured via BROADCAST_BOT_TOKENS (comma-separated). Add more
  *   tokens to that env var any time to scale out — no code changes.
@@ -323,18 +329,11 @@ async function getMeWithRetry(bot, label, maxAttempts = 5) {
   }
 }
 
-async function initBotPool() {
+// ---- Auth bot: its own init function, its own lifecycle ----
+async function initAuthBot() {
   const authToken = process.env.AUTH_BOT_TOKEN;
   if (!authToken) throw new Error('AUTH_BOT_TOKEN is required — the auth bot is not optional.');
 
-  const rawBroadcastTokens = (process.env.BROADCAST_BOT_TOKENS || '')
-    .split(',').map(t => t.trim()).filter(Boolean);
-
-  if (rawBroadcastTokens.length === 0) {
-    throw new Error('BROADCAST_BOT_TOKENS is required — need at least 1 broadcast bot, recommend 3-4.');
-  }
-
-  // ---- Auth bot ----
   const authBot = new Telegraf(authToken);
   authBot.webhookReply = false;
   authBot.options.webhookReply = false;
@@ -344,8 +343,17 @@ async function initBotPool() {
   authBot.username = authInfo.username;
   botPool.authBot = authBot;
   console.log('Auth bot ready: @' + authInfo.username);
+}
 
-  // ---- Broadcast bot pool ----
+// ---- Broadcast pool: its own init function, its own lifecycle ----
+async function initBroadcastPool() {
+  const rawBroadcastTokens = (process.env.BROADCAST_BOT_TOKENS || '')
+    .split(',').map(t => t.trim()).filter(Boolean);
+
+  if (rawBroadcastTokens.length === 0) {
+    throw new Error('BROADCAST_BOT_TOKENS is required — need at least 1 broadcast bot, recommend 3-4.');
+  }
+
   for (let i = 0; i < rawBroadcastTokens.length; i++) {
     const token = rawBroadcastTokens[i];
     const bot = new Telegraf(token);
@@ -358,7 +366,7 @@ async function initBotPool() {
     console.log('Broadcast bot[' + i + '] ready: @' + info.username);
   }
 
-  console.log('Bot pool initialized: 1 auth bot + ' + botPool.broadcastBots.length + ' broadcast bots');
+  console.log('Broadcast pool initialized: ' + botPool.broadcastBots.length + ' bot(s)');
 }
 
 // ==================== WEBHOOK SETUP (once per bot, at boot) ====================
@@ -398,16 +406,17 @@ async function setWebhookWithRetry(bot, url, label, maxAttempts = 5) {
   throw new Error('Gave up setting webhook for ' + label + ' after ' + maxAttempts + ' attempts');
 }
 
-async function setupAllWebhooks() {
+async function setupAuthWebhook() {
   const authUrl = 'https://' + DOMAIN + '/webhook/auth/' + WEBHOOK_SECRET;
   await setWebhookWithRetry(botPool.authBot, authUrl, 'auth bot');
+}
 
+async function setupBroadcastWebhooks() {
   for (const entry of botPool.broadcastBots) {
     const url = 'https://' + DOMAIN + '/webhook/broadcast/' + entry.index + '/' + WEBHOOK_SECRET;
     await setWebhookWithRetry(entry.bot, url, 'broadcast bot[' + entry.index + '] (@' + entry.username + ')');
   }
-
-  console.log('All webhooks registered.');
+  console.log('Broadcast webhooks registered.');
 }
 
 // ==================== TEXT / HTML UTILITIES ====================
@@ -968,9 +977,13 @@ app.get('/api/auth/me', authenticateToken, function(req, res) {
 
 // Connect 2FA: just a deep link into the SHARED auth bot. No token entry
 // or validation needed since there's nothing per-user to configure.
+//
+// FIX: this now checks authBotReady (auth bot's own readiness), NOT
+// serverReady (which also waits on the entire broadcast pool). A bad
+// or slow BROADCAST_BOT_TOKENS entry must never be able to break login.
 app.get('/api/auth/connect-telegram-link', authenticateToken, function(req, res) {
-  if (!serverReady || !botPool.authBot) {
-    return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
+  if (!authBotReady || !botPool.authBot) {
+    return res.status(503).json({ error: 'Auth bot is still starting up. Please try again in a few seconds.' });
   }
   const startLink = 'https://t.me/' + botPool.authBot.username + '?start=' + req.user.id;
   res.json({ success: true, startLink: startLink, botUsername: '@' + botPool.authBot.username });
@@ -1695,7 +1708,7 @@ app.get('/admin-limits', async function(req, res) {
     '<body>\n' +
     '  <div class="container">\n' +
     '    <h1>Server Admin Panel</h1>\n' +
-    '    <div class="pool">Bot pool: 1 auth bot + ' + botPool.poolSize + ' broadcast bots</div>\n' +
+    '    <div class="pool">Bot pool: 1 auth bot (' + (authBotReady ? 'ready' : 'starting') + ') + ' + botPool.poolSize + ' broadcast bots</div>\n' +
     '    <div class="stats">\n' +
     '      <div class="stat-box">\n' +
     '        <div class="stat-number">' + totalUsers + '</div>\n' +
@@ -1803,20 +1816,27 @@ mongoose.connection.once('open', async function() {
   try {
     await loadAdminSettings();
 
-    // Bot pool: init once, register handlers once, set webhooks once.
-    // No more per-user bot lifecycle — this happens exactly once at boot
-    // regardless of how many Sendm users/contacts exist.
-    await initBotPool();
+    // ---- Phase 1: Auth bot. Independent lifecycle, own readiness flag.
+    // Login/2FA must come online as fast as possible and must not be
+    // blocked by anything broadcast-pool related below.
+    await initAuthBot();
     registerAuthBotHandlers(botPool.authBot);
+    await setupAuthWebhook();
+    authBotReady = true;
+    console.log('✅ Auth bot fully ready — login/2FA is live.');
+
+    // ---- Phase 2: Broadcast pool. Separate lifecycle. If this throws,
+    // auth keeps working; only broadcast/subscribe routes stay gated.
+    await initBroadcastPool();
     botPool.broadcastBots.forEach(function(entry) {
       registerBroadcastBotHandlers(entry.bot, entry.index);
     });
-    await setupAllWebhooks();
+    await setupBroadcastWebhooks();
 
     await recoverLostScheduledBroadcasts();
 
     serverReady = true;
-    console.log('Startup sequence completed — server is now accepting bot-dependent requests');
+    console.log('✅ Startup sequence completed — server is now accepting all bot-dependent requests');
   } catch (err) {
     // Do NOT let the process limp along with an empty bot pool — that's
     // what caused subscribes to fail with confusing Mongoose/undefined
@@ -1843,7 +1863,8 @@ process.on('SIGINT', async function() {
 });
 
 app.get('/ping', function(req, res) {
-  if (!serverReady) return res.status(503).type('text/plain').send('starting up [' + BUILD_TAG + ']');
+  if (!authBotReady) return res.status(503).type('text/plain').send('auth bot starting up [' + BUILD_TAG + ']');
+  if (!serverReady) return res.status(200).type('text/plain').send('auth ok, broadcast pool starting [' + BUILD_TAG + ']');
   res.status(200).type('text/plain').send('ok [' + BUILD_TAG + ']');
 });
 
