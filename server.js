@@ -17,32 +17,22 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-//
-// IMPORTANT: if /ping does not show THIS tag after you deploy, Render is
-// serving stale code and nothing below will matter until that's fixed.
-const BUILD_TAG = 'response-header-proof-2026-07-15-v2';
+const BUILD_TAG = 'shared-bot-pool-rewrite-2026-07-16-v1';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
 const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 3);
 
-// Stamp EVERY response with the build tag, no exceptions. This makes it
-// impossible to be unsure whether a stale deploy is the problem: open
-// dev tools -> Network tab -> any request -> Response Headers ->
-// X-Sendm-Build. If that value isn't the tag below, Render is not
-// running this file, full stop, regardless of what any route returns.
 app.use(function(req, res, next) {
   res.setHeader('X-Sendm-Build', BUILD_TAG);
   next();
 });
 
-// Two SEPARATE readiness flags. This is the key fix in this version:
-// auth (login/2FA) must never be blocked by the broadcast bot pool.
-// A bad/slow/rate-limited BROADCAST_BOT_TOKENS entry should not be able
-// to 503 the auth-connect route — they are unrelated subsystems.
-let authBotReady = false;   // true once the auth bot + its webhook are up
-let serverReady = false;    // true once auth bot AND broadcast pool are both up
+// Two SEPARATE readiness flags: auth (login/2FA) must never be blocked
+// by the broadcast bot pool.
+let authBotReady = false;
+let serverReady = false;
 
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
@@ -56,10 +46,6 @@ if (!DOMAIN) {
   process.exit(1);
 }
 
-// Unlike the old per-user-bot version, we do NOT auto-generate a
-// fallback WEBHOOK_SECRET. In a multi-instance deploy a per-process
-// random secret breaks routing (each instance would register a
-// different webhook path with Telegram). Fail loud instead.
 if (!WEBHOOK_SECRET || !WEBHOOK_SECRET.trim()) {
   console.error('ERROR: WEBHOOK_SECRET must be set in env and stable across restarts/instances.');
   process.exit(1);
@@ -96,9 +82,9 @@ mongoose.connect(MONGODB_URI, {
   serverSelectionTimeoutMS: 30000,
   socketTimeoutMS: 45000,
   connectTimeoutMS: 30000,
-}).then(() => {
+}).then(function() {
   console.log('✅ MongoDB connected');
-}).catch(err => {
+}).catch(function(err) {
   console.error('MongoDB connection failed:', err.message);
   process.exit(1);
 });
@@ -109,7 +95,6 @@ const userSchema = new mongoose.Schema({
   fullName: String,
   email: { type: String, required: true, unique: true, lowercase: true },
   password: String,
-  // Auth 2FA is bound to the single shared auth bot, not a per-user bot.
   telegramChatId: String,
   isTelegramConnected: { type: Boolean, default: false },
   isSubscribed: { type: Boolean, default: false },
@@ -135,16 +120,11 @@ const formPageSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const contactSchema = new mongoose.Schema({
-  userId: { type: String, required: true },       // the Sendm creator who owns this subscriber
-  shortId: String,                                  // which form they subscribed via
+  userId: { type: String, required: true },
+  shortId: String,
   name: String,
-  contact: { type: String, required: true },        // email or phone, used for bot assignment + identity
+  contact: { type: String, required: true },
   telegramChatId: String,
-  // Telegram @username, captured at /start confirm time (ctx.from.username).
-  // Optional field on Telegram's side — many users won't have one, so this
-  // can be null. Convenience/display only; never used for identity or
-  // bot assignment (telegramChatId + contact remain the real identity
-  // anchors), since usernames can change at any time.
   telegramUsername: String,
   status: { type: String, default: 'pending' },
   submittedAt: Date,
@@ -152,12 +132,8 @@ const contactSchema = new mongoose.Schema({
   unsubscribedAt: Date,
 }, { timestamps: true });
 
-// A subscription link the user hasn't confirmed via /start yet.
-// Previously an in-memory Map (lost on restart) — now a real
-// TTL-indexed document so it survives restarts and multi-instance
-// deployments on Render.
 const pendingSubscriberSchema = new mongoose.Schema({
-  payload: { type: String, required: true, unique: true }, // 'sub_<shortId>_<uuid>'
+  payload: { type: String, required: true, unique: true },
   userId: { type: String, required: true },
   shortId: String,
   name: String,
@@ -208,11 +184,10 @@ const PendingSubscriber = mongoose.model('PendingSubscriber', pendingSubscriberS
 const ScheduledBroadcast = mongoose.model('ScheduledBroadcast', scheduledBroadcastSchema);
 const BroadcastDaily = mongoose.model('BroadcastDaily', broadcastDailySchema);
 
-// Indexes
 contactSchema.index({ userId: 1 });
 contactSchema.index({ userId: 1, contact: 1 });
 contactSchema.index({ userId: 1, status: 1 });
-contactSchema.index({ status: 1 }); // broadcast worker fans out by status
+contactSchema.index({ status: 1 });
 landingPageSchema.index({ userId: 1 });
 formPageSchema.index({ userId: 1 });
 scheduledBroadcastSchema.index({ userId: 1 });
@@ -245,7 +220,8 @@ function getUserCache(userId) {
   return bucket;
 }
 
-function invalidateUserCache(userId, type = 'all') {
+function invalidateUserCache(userId, type) {
+  if (!type) type = 'all';
   const bucket = userCache.get(userId);
   if (!bucket) return;
   if (type === 'pages' || type === 'all') { bucket.pages = null; bucket.pagesTs = 0; }
@@ -258,7 +234,7 @@ function invalidatePublicCache(key) {
   publicCache.delete(key);
 }
 
-setInterval(() => {
+setInterval(function() {
   const now = Date.now();
   const INACTIVE_THRESHOLD = 30 * 60 * 1000;
 
@@ -276,42 +252,14 @@ setInterval(() => {
 let adminSettingsCache = { dailyBroadcastLimit: 3, maxLandingPages: 5, maxForms: 5 };
 
 // ==================== SHARED BOT POOL ====================
-/**
- * Shared platform-owned bot pool.
- *
- * - ONE auth bot: handles 2FA/login codes only. Dedicated token.
- *   Boots and becomes ready INDEPENDENTLY of the broadcast pool — see
- *   initAuthBot() / authBotReady below.
- * - N broadcast bots: shared workhorses that deliver subscriber content.
- *   Configured via BROADCAST_BOT_TOKENS (comma-separated). Add more
- *   tokens to that env var any time to scale out — no code changes.
- *
- * Bot assignment: SIMPLE DESIGN. Nothing is stored on the Contact/
- * PendingSubscriber documents. Every time we need to know which bot a
- * contact talks to, we compute it fresh: md5(contact) % poolSize. Same
- * contact + same pool size always gives the same bot, so a subscriber
- * consistently lands on the same bot without us ever persisting or
- * validating a stale index. This removes the whole class of "botKey is
- * undefined/stale/out of range" bugs the stored-key version had.
- *
- * CAVEAT: if you resize the pool (add/remove BROADCAST_BOT_TOKENS)
- * while someone is mid-flow (subscribed but hasn't clicked the Telegram
- * link yet), they could get a different bot at confirm time than at
- * subscribe time. Low-stakes at this scale — just avoid resizing the
- * pool during a big active campaign, and existing SUBSCRIBED contacts
- * are unaffected since sends look up telegramChatId directly.
- */
 const botPool = {
   authBot: null,
-  broadcastBots: [], // array of { bot, index, token, username }
+  broadcastBots: [],
 
   get poolSize() {
     return this.broadcastBots.length;
   },
 
-  // Returns the { bot, index, token, username } entry this contact
-  // should use, computed fresh — never throws on empty pool, returns
-  // null instead so callers can give a clean "try again" response.
   getBotForContact(contactValue) {
     if (this.poolSize === 0) return null;
     const hash = crypto.createHash('md5').update(String(contactValue).toLowerCase().trim()).digest('hex');
@@ -325,7 +273,8 @@ const botPool = {
   },
 };
 
-async function getMeWithRetry(bot, label, maxAttempts = 5) {
+async function getMeWithRetry(bot, label, maxAttempts) {
+  if (!maxAttempts) maxAttempts = 5;
   let attempts = 0;
   while (attempts < maxAttempts) {
     attempts++;
@@ -334,12 +283,11 @@ async function getMeWithRetry(bot, label, maxAttempts = 5) {
     } catch (err) {
       console.warn(label + ' getMe attempt ' + attempts + '/' + maxAttempts + ' failed: ' + err.message);
       if (attempts >= maxAttempts) throw err;
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise(function(r) { setTimeout(r, 5000); });
     }
   }
 }
 
-// ---- Auth bot: its own init function, its own lifecycle ----
 async function initAuthBot() {
   const authToken = process.env.AUTH_BOT_TOKEN;
   if (!authToken) throw new Error('AUTH_BOT_TOKEN is required — the auth bot is not optional.');
@@ -347,7 +295,7 @@ async function initAuthBot() {
   const authBot = new Telegraf(authToken);
   authBot.webhookReply = false;
   authBot.options.webhookReply = false;
-  authBot.catch((err) => console.error('Auth bot error:', err.message));
+  authBot.catch(function(err) { console.error('Auth bot error:', err.message); });
 
   const authInfo = await getMeWithRetry(authBot, 'auth bot');
   authBot.username = authInfo.username;
@@ -355,10 +303,9 @@ async function initAuthBot() {
   console.log('Auth bot ready: @' + authInfo.username);
 }
 
-// ---- Broadcast pool: its own init function, its own lifecycle ----
 async function initBroadcastPool() {
   const rawBroadcastTokens = (process.env.BROADCAST_BOT_TOKENS || '')
-    .split(',').map(t => t.trim()).filter(Boolean);
+    .split(',').map(function(t) { return t.trim(); }).filter(Boolean);
 
   if (rawBroadcastTokens.length === 0) {
     throw new Error('BROADCAST_BOT_TOKENS is required — need at least 1 broadcast bot, recommend 3-4.');
@@ -369,10 +316,10 @@ async function initBroadcastPool() {
     const bot = new Telegraf(token);
     bot.webhookReply = false;
     bot.options.webhookReply = false;
-    bot.catch((err) => console.error('Broadcast bot[' + i + '] error:', err.message));
+    bot.catch(function(err) { console.error('Broadcast bot[' + i + '] error:', err.message); });
 
     const info = await getMeWithRetry(bot, 'broadcast bot[' + i + ']');
-    botPool.broadcastBots.push({ bot, index: i, token, username: info.username });
+    botPool.broadcastBots.push({ bot: bot, index: i, token: token, username: info.username });
     console.log('Broadcast bot[' + i + '] ready: @' + info.username);
   }
 
@@ -380,7 +327,8 @@ async function initBroadcastPool() {
 }
 
 // ==================== WEBHOOK SETUP (once per bot, at boot) ====================
-async function setWebhookWithRetry(bot, url, label, maxAttempts = 5) {
+async function setWebhookWithRetry(bot, url, label, maxAttempts) {
+  if (!maxAttempts) maxAttempts = 5;
   let attempts = 0;
   while (attempts < maxAttempts) {
     attempts++;
@@ -405,12 +353,12 @@ async function setWebhookWithRetry(bot, url, label, maxAttempts = 5) {
       if (err.response && err.response.error_code === 429) {
         const retryAfter = (err.response.parameters && err.response.parameters.retry_after) || 30;
         console.warn(label + ' rate limited, waiting ' + (retryAfter + 5) + 's');
-        await new Promise(r => setTimeout(r, (retryAfter + 5) * 1000));
+        await new Promise(function(r) { setTimeout(r, (retryAfter + 5) * 1000); });
         continue;
       }
       console.error(label + ' webhook attempt ' + attempts + ' failed: ' + err.message);
       if (attempts >= maxAttempts) throw err;
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise(function(r) { setTimeout(r, 5000); });
     }
   }
   throw new Error('Gave up setting webhook for ' + label + ' after ' + maxAttempts + ' attempts');
@@ -437,7 +385,7 @@ function escapeHtml(unsafe) {
 
 function sanitizeTelegramHtml(unsafe) {
   if (!unsafe || typeof unsafe !== 'string') return '';
-  const allowedTags = new Set(['b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','code','pre','tg-emoji','blockquote']);
+  const allowedTags = new Set(['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'span', 'tg-spoiler', 'a', 'code', 'pre', 'tg-emoji', 'blockquote']);
   const allowedAttrs = { a: ['href'], 'tg-emoji': ['emoji-id'], 'blockquote': ['expandable'] };
 
   let clean = unsafe
@@ -538,7 +486,7 @@ function getUserLimits(user) {
 async function incrementDailyBroadcast(userId) {
   const today = getTodayDateString();
   const record = await BroadcastDaily.findOneAndUpdate(
-    { userId, date: today }, { $inc: { count: 1 } }, { upsert: true, new: true }
+    { userId: userId, date: today }, { $inc: { count: 1 } }, { upsert: true, new: true }
   );
   return record.count;
 }
@@ -563,13 +511,8 @@ async function send2FACodeViaBot(user, code) {
 }
 
 // ==================== BOT HANDLERS ====================
-/**
- * Auth bot: every Sendm user talks to the SAME shared bot. We tell them
- * apart via the /start payload (their userId) — same trick as the old
- * per-user model, just no longer needing a distinct bot instance.
- */
 function registerAuthBotHandlers(authBot) {
-  authBot.start(async (ctx) => {
+  authBot.start(async function(ctx) {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
 
@@ -591,7 +534,7 @@ function registerAuthBotHandlers(authBot) {
     await ctx.replyWithHTML('<b>Sendm 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
   });
 
-  authBot.command('status', async (ctx) => {
+  authBot.command('status', async function(ctx) {
     const chatId = ctx.chat.id.toString();
     const user = await User.findOne({ telegramChatId: chatId, isTelegramConnected: true });
     if (!user) {
@@ -602,19 +545,10 @@ function registerAuthBotHandlers(authBot) {
   });
 }
 
-/**
- * Wires up ONE broadcast bot's /start handler. Called once per bot in
- * the pool at boot. All broadcast bots share identical logic — the
- * only thing that differs is which token/webhook route they run on,
- * since sharding already guarantees a contact's /start click always
- * lands on the correct bot's webhook.
- */
 function registerBroadcastBotHandlers(bot, botIndex) {
-  bot.start(async (ctx) => {
+  bot.start(async function(ctx) {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
-    // Telegram usernames are optional and can change at any time —
-    // captured here purely for display/convenience, never for identity.
     const tgUsername = ctx.from && ctx.from.username ? ctx.from.username : null;
 
     if (!payload.startsWith('sub_')) {
@@ -632,16 +566,12 @@ function registerBroadcastBotHandlers(bot, botIndex) {
       return;
     }
 
-    // Note: with the simple design, whichever bot this /start lands on
-    // IS the bot this contact will use going forward — we just record
-    // telegramChatId, no separate shard-key bookkeeping needed.
-
     let targetContact = await Contact.findOne({ userId: pending.userId, telegramChatId: chatId });
     const contactsByValue = await Contact.find({ userId: pending.userId, contact: pending.contact });
 
     if (!targetContact) {
-      targetContact = contactsByValue.find(c => c.status === 'subscribed') ||
-        contactsByValue.find(c => c.shortId === pending.shortId) ||
+      targetContact = contactsByValue.find(function(c) { return c.status === 'subscribed'; }) ||
+        contactsByValue.find(function(c) { return c.shortId === pending.shortId; }) ||
         contactsByValue[0];
     }
 
@@ -702,11 +632,6 @@ function registerBroadcastBotHandlers(bot, botIndex) {
 }
 
 // ==================== BROADCAST WORKER ====================
-/**
- * Sends `chunks` to a single contact. Which bot to use is computed
- * fresh from the contact's identity value — nothing stored, nothing
- * that can go stale.
- */
 async function sendToContact(contact, chunks) {
   const entry = botPool.getBotForContact(contact.contact);
   if (!entry) throw new Error('No broadcast bot available (pool empty) for contact ' + contact.contact);
@@ -715,11 +640,6 @@ async function sendToContact(contact, chunks) {
   }
 }
 
-/**
- * Sends a batch of contacts using whichever bot each one is sharded to.
- * Contacts in a batch can belong to different bots, so sends run
- * concurrently — one contact's send doesn't block another's.
- */
 async function sendBatch(batch, chunks, stats) {
   const sendPromises = batch.map(async function(contact) {
     try {
@@ -742,7 +662,9 @@ async function sendBatch(batch, chunks, stats) {
 }
 
 async function processBroadcast(job) {
-  const { userId, message, broadcastId } = job.data;
+  const userId = job.data.userId;
+  const message = job.data.message;
+  const broadcastId = job.data.broadcastId;
   const chunks = splitTelegramMessage(message);
 
   const targets = await Contact.find({
@@ -762,12 +684,10 @@ async function processBroadcast(job) {
   for (let b = 0; b < batches.length; b++) {
     await sendBatch(batches[b], chunks, stats);
     if (b < batches.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, BATCH_INTERVAL_MS));
+      await new Promise(function(resolve) { setTimeout(resolve, BATCH_INTERVAL_MS); });
     }
   }
 
-  // Delivery report goes to the CREATOR via the auth bot (their 2FA
-  // chat), not a broadcast bot — the creator isn't a subscriber shard.
   const user = await User.findOne({ id: userId });
   let reportText = broadcastId ? '<b>Scheduled Broadcast Report</b>\n\n' : '<b>Broadcast Report</b>\n\n';
   if (total === 0) {
@@ -803,7 +723,9 @@ worker.on('completed', function(job) {
 
 worker.on('failed', async function(job, err) {
   console.error('Broadcast job (' + (job.id || 'immediate') + ') failed permanently: ' + err.message);
-  const { userId, broadcastId } = job.data || {};
+  const data = job.data || {};
+  const userId = data.userId;
+  const broadcastId = data.broadcastId;
   if (broadcastId) {
     await ScheduledBroadcast.findOneAndUpdate({ broadcastId: broadcastId }, { status: 'failed' }).catch(function() {});
   }
@@ -814,7 +736,7 @@ worker.on('failed', async function(job, err) {
       : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
     try {
       await botPool.authBot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
-    } catch {}
+    } catch (e) {}
   }
 });
 
@@ -887,7 +809,7 @@ const formSubmitLimiter = rateLimit({
 });
 
 // ==================== WEBHOOK ROUTES (one per bot) ====================
-app.post('/webhook/auth/:secret', async (req, res) => {
+app.post('/webhook/auth/:secret', async function(req, res) {
   if (req.params.secret !== WEBHOOK_SECRET) return res.sendStatus(404);
   try {
     const update = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString('utf8')) : req.body;
@@ -898,7 +820,7 @@ app.post('/webhook/auth/:secret', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.post('/webhook/broadcast/:botIndex/:secret', async (req, res) => {
+app.post('/webhook/broadcast/:botIndex/:secret', async function(req, res) {
   if (req.params.secret !== WEBHOOK_SECRET) return res.sendStatus(404);
   const idx = parseInt(req.params.botIndex, 10);
   const entry = botPool.getBroadcastBotByIndex(idx);
@@ -935,7 +857,9 @@ const authenticateToken = async function(req, res, next) {
 
 // ==================== AUTH ROUTES ====================
 app.post('/api/auth/register', authLimiter, async function(req, res) {
-  const { fullName, email, password } = req.body;
+  const fullName = req.body.fullName;
+  const email = req.body.email;
+  const password = req.body.password;
   if (!fullName || !email || !password) return res.status(400).json({ error: 'All fields required' });
 
   const existing = await User.findOne({ email: email.toLowerCase() });
@@ -958,7 +882,8 @@ app.post('/api/auth/register', authLimiter, async function(req, res) {
 });
 
 app.post('/api/auth/login', authLimiter, async function(req, res) {
-  const { email, password } = req.body;
+  const email = req.body.email;
+  const password = req.body.password;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
   const user = await User.findOne({ email: email.toLowerCase() });
@@ -985,13 +910,11 @@ app.get('/api/auth/me', authenticateToken, function(req, res) {
   });
 });
 
-// Connect 2FA: just a deep link into the SHARED auth bot. No token entry
-// or validation needed since there's nothing per-user to configure.
-//
-// FIX: this now checks authBotReady (auth bot's own readiness), NOT
-// serverReady (which also waits on the entire broadcast pool). A bad
-// or slow BROADCAST_BOT_TOKENS entry must never be able to break login.
-app.get('/api/auth/connect-telegram-link', authenticateToken, function(req, res) {
+// Connect 2FA: deep link into the SHARED auth bot.
+// Renamed from /connect-telegram-link -> /link-2fa (short + clear intent).
+// Checks authBotReady (not serverReady) so a slow/broken broadcast pool
+// can never block login/2FA linking.
+app.get('/api/auth/link-2fa', authenticateToken, function(req, res) {
   const bot = botPool.authBot;
   if (!bot || !bot.username) {
     return res.status(503).json({ error: 'Auth bot not ready yet, try again shortly.' });
@@ -1015,7 +938,7 @@ app.get('/api/auth/bot-status', authenticateToken, function(req, res) {
 });
 
 app.post('/api/auth/forgot-password', async function(req, res) {
-  const { email } = req.body;
+  const email = req.body.email;
   if (!email) return res.status(400).json({ error: 'Email required' });
 
   const user = await User.findOne({ email: email.toLowerCase() });
@@ -1033,7 +956,8 @@ app.post('/api/auth/forgot-password', async function(req, res) {
 });
 
 app.post('/api/auth/verify-reset-code', function(req, res) {
-  const { resetToken, code } = req.body;
+  const resetToken = req.body.resetToken;
+  const code = req.body.code;
   if (!resetToken || !code) return res.status(400).json({ error: 'Token and code required' });
 
   const entry = resetTokens.get(resetToken);
@@ -1047,7 +971,8 @@ app.post('/api/auth/verify-reset-code', function(req, res) {
 });
 
 app.post('/api/auth/reset-password', async function(req, res) {
-  const { resetToken, newPassword } = req.body;
+  const resetToken = req.body.resetToken;
+  const newPassword = req.body.newPassword;
   if (!resetToken || !newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Valid token and password required' });
 
   const entry = resetTokens.get(resetToken);
@@ -1066,7 +991,7 @@ app.post('/api/auth/reset-password', async function(req, res) {
   res.json({ success: true, message: 'Password reset successful' });
 });
 
-// ==================== SUBSCRIPTION ROUTES (Paystack, unchanged) ====================
+// ==================== SUBSCRIPTION ROUTES (Paystack) ====================
 app.get('/api/subscription/status', authenticateToken, async function(req, res) {
   const subscribed = hasActiveSubscription(req.user);
   res.json({
@@ -1124,7 +1049,7 @@ app.post('/api/subscription/webhook', async function(req, res) {
 
     if (event.event === 'charge.success') {
       const reference = event.data.reference;
-      const userId = event.data.metadata?.userId;
+      const userId = event.data.metadata && event.data.metadata.userId;
 
       if (!userId) return res.status(200).send('OK');
 
@@ -1170,7 +1095,7 @@ app.get('/p/:shortId', async function(req, res) {
 
   const processedBlocks = page.config.blocks.map(function(block) {
     if (block.type === 'text') {
-      return { ...block, htmlContent: textToHtmlForDisplay(block.content) };
+      return Object.assign({}, block, { htmlContent: textToHtmlForDisplay(block.content) });
     }
     return block;
   });
@@ -1308,7 +1233,9 @@ app.get('/api/form/:shortId', async function(req, res) {
 
 // ==================== LANDING PAGES WRITE ROUTES ====================
 app.post('/api/pages/save', authenticateToken, async function(req, res) {
-  const { shortId, title, config } = req.body;
+  const shortId = req.body.shortId;
+  const title = req.body.title;
+  const config = req.body.config;
   if (!title || !config || !Array.isArray(config.blocks)) return res.status(400).json({ error: 'Title and config.blocks required' });
 
   const limits = getUserLimits(req.user);
@@ -1334,9 +1261,12 @@ app.post('/api/pages/save', authenticateToken, async function(req, res) {
 
   if (cleanBlocks.length === 0) return res.status(400).json({ error: 'No valid blocks' });
 
+  const updateDoc = { userId: req.user.id, title: title.trim(), config: { blocks: cleanBlocks }, updatedAt: now };
+  if (!shortId) updateDoc.createdAt = now;
+
   await LandingPage.findOneAndUpdate(
     { shortId: finalShortId },
-    { userId: req.user.id, title: title.trim(), config: { blocks: cleanBlocks }, updatedAt: now, createdAt: shortId ? undefined : now },
+    updateDoc,
     { upsert: true }
   );
 
@@ -1349,7 +1279,7 @@ app.post('/api/pages/save', authenticateToken, async function(req, res) {
 });
 
 app.post('/api/pages/delete', authenticateToken, async function(req, res) {
-  const { shortId } = req.body;
+  const shortId = req.body.shortId;
   const page = await LandingPage.findOne({ shortId: shortId, userId: req.user.id });
   if (!page) return res.status(404).json({ error: 'Page not found' });
   await LandingPage.deleteOne({ shortId: shortId });
@@ -1363,7 +1293,10 @@ app.post('/api/pages/delete', authenticateToken, async function(req, res) {
 
 // ==================== FORMS WRITE ROUTES ====================
 app.post('/api/forms/save', authenticateToken, async function(req, res) {
-  const { shortId, title, state, welcomeMessage } = req.body;
+  const shortId = req.body.shortId;
+  const title = req.body.title;
+  const state = req.body.state;
+  const welcomeMessage = req.body.welcomeMessage;
   if (!title || !state) return res.status(400).json({ error: 'Title and state required' });
 
   const limits = getUserLimits(req.user);
@@ -1387,9 +1320,12 @@ app.post('/api/forms/save', authenticateToken, async function(req, res) {
   const finalShortId = shortId || uuidv4().slice(0, 8);
   const now = new Date();
 
+  const updateDoc = { userId: req.user.id, title: title.trim(), state: sanitizedState, welcomeMessage: sanitizedWelcome, updatedAt: now };
+  if (!shortId) updateDoc.createdAt = now;
+
   await FormPage.findOneAndUpdate(
     { shortId: finalShortId },
-    { userId: req.user.id, title: title.trim(), state: sanitizedState, welcomeMessage: sanitizedWelcome, updatedAt: now, createdAt: shortId ? undefined : now },
+    updateDoc,
     { upsert: true }
   );
 
@@ -1402,7 +1338,7 @@ app.post('/api/forms/save', authenticateToken, async function(req, res) {
 });
 
 app.post('/api/forms/delete', authenticateToken, async function(req, res) {
-  const { shortId } = req.body;
+  const shortId = req.body.shortId;
   const form = await FormPage.findOne({ shortId: shortId, userId: req.user.id });
   if (!form) return res.status(404).json({ error: 'Form not found' });
   await FormPage.deleteOne({ shortId: shortId });
@@ -1423,7 +1359,8 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
   try {
     const shortId = req.params.shortId;
-    const { name, email } = req.body;
+    const name = req.body.name;
+    const email = req.body.email;
 
     if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
     if (!email || !email.trim()) return res.status(400).json({ error: 'Contact is required' });
@@ -1440,8 +1377,6 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
     const owner = await User.findOne({ id: form.userId });
     if (!owner) return res.status(400).json({ error: 'Form owner not found' });
 
-    // Which broadcast bot handles this contact is computed fresh, right
-    // here, every time — nothing stored, nothing that can go stale.
     const broadcastBotEntry = botPool.getBotForContact(contactValue);
     if (!broadcastBotEntry) {
       console.error('No broadcast bot available (pool empty) for contact ' + contactValue + ' (owner ' + owner.id + ')');
@@ -1459,7 +1394,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
         contact.submittedAt = new Date();
         await contact.save();
 
-        await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue });
+        await PendingSubscriber.create({ payload: payload, userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue });
 
         const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
         return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
@@ -1480,7 +1415,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
     }
     await contact.save();
 
-    await PendingSubscriber.create({ payload, userId: owner.id, shortId, name: name.trim(), contact: contactValue });
+    await PendingSubscriber.create({ payload: payload, userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue });
 
     const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
     res.json({ success: true, deepLink: deepLink });
@@ -1493,7 +1428,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 });
 
 app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
-  const { contacts } = req.body;
+  const contacts = req.body.contacts;
   if (!Array.isArray(contacts) || contacts.length === 0) return res.status(400).json({ error: 'Provide contact array' });
 
   const result = await Contact.deleteMany({ userId: req.user.id, contact: { $in: contacts } });
@@ -1509,7 +1444,7 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
   }
 
-  const { message } = req.body;
+  const message = req.body.message;
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
   const processed = message.trim();
@@ -1548,7 +1483,9 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     return res.status(503).json({ error: 'Server is still starting up. Please try again in a few seconds.' });
   }
 
-  const { message, scheduledTime, recipients = 'all' } = req.body;
+  const message = req.body.message;
+  const scheduledTime = req.body.scheduledTime;
+  const recipients = req.body.recipients || 'all';
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
   const processed = message.trim();
@@ -1623,7 +1560,9 @@ app.delete('/api/broadcast/scheduled/:broadcastId', authenticateToken, async fun
 });
 
 app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async function(req, res) {
-  const { message, scheduledTime, recipients } = req.body;
+  const message = req.body.message;
+  const scheduledTime = req.body.scheduledTime;
+  const recipients = req.body.recipients;
   const task = await ScheduledBroadcast.findOne({ broadcastId: req.params.broadcastId, userId: req.user.id, status: 'pending' });
 
   if (!task) return res.status(400).json({ error: 'Cannot edit this broadcast' });
@@ -1755,7 +1694,10 @@ app.get('/admin-limits', async function(req, res) {
 });
 
 app.post('/admin-limits', async function(req, res) {
-  const { password, daily_broadcast, max_pages, max_forms } = req.body;
+  const password = req.body.password;
+  const daily_broadcast = req.body.daily_broadcast;
+  const max_pages = req.body.max_pages;
+  const max_forms = req.body.max_forms;
 
   if (password !== ADMIN_PASSWORD) {
     return res.send('<html><body style="background:#121212;color:#f44336;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;text-align:center;"><h1>Access Denied<br>Wrong Password</h1></body></html>');
@@ -1831,16 +1773,13 @@ mongoose.connection.once('open', async function() {
     await loadAdminSettings();
 
     // ---- Phase 1: Auth bot. Independent lifecycle, own readiness flag.
-    // Login/2FA must come online as fast as possible and must not be
-    // blocked by anything broadcast-pool related below.
     await initAuthBot();
     registerAuthBotHandlers(botPool.authBot);
     await setupAuthWebhook();
     authBotReady = true;
     console.log('✅ Auth bot fully ready — login/2FA is live.');
 
-    // ---- Phase 2: Broadcast pool. Separate lifecycle. If this throws,
-    // auth keeps working; only broadcast/subscribe routes stay gated.
+    // ---- Phase 2: Broadcast pool. Separate lifecycle.
     await initBroadcastPool();
     botPool.broadcastBots.forEach(function(entry) {
       registerBroadcastBotHandlers(entry.bot, entry.index);
@@ -1852,11 +1791,6 @@ mongoose.connection.once('open', async function() {
     serverReady = true;
     console.log('✅ Startup sequence completed — server is now accepting all bot-dependent requests');
   } catch (err) {
-    // Do NOT let the process limp along with an empty bot pool — that's
-    // what caused subscribes to fail with confusing Mongoose/undefined
-    // errors while the server looked "up" from the outside. Fail loud so
-    // Render restarts/reports the deploy as broken instead of routing
-    // real traffic to a half-initialized instance.
     console.error('FATAL: startup sequence failed, exiting:', err.message);
     process.exit(1);
   }
@@ -1887,6 +1821,6 @@ app.use(function(req, res) {
 });
 
 app.listen(PORT, function() {
-  console.log('\nSENDEM SERVER — SHARED BOT-POOL MODEL (auth bot + broadcast pool)');
+  console.log('\nSENDM SERVER — SHARED BOT-POOL MODEL (auth bot + broadcast pool)');
   console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
