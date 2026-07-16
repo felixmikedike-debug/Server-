@@ -17,7 +17,7 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-const BUILD_TAG = 'shared-bot-pool-rewrite-2026-07-16-v1';
+const BUILD_TAG = 'telegram-connect-route-2026-07-16-v2';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
@@ -911,10 +911,11 @@ app.get('/api/auth/me', authenticateToken, function(req, res) {
 });
 
 // Connect 2FA: deep link into the SHARED auth bot.
-// Renamed from /connect-telegram-link -> /link-2fa (short + clear intent).
-// Checks authBotReady (not serverReady) so a slow/broken broadcast pool
-// can never block login/2FA linking.
-app.get('/api/auth/link-2fa', authenticateToken, function(req, res) {
+// Route: /api/telegram/connect — grouped under its own "telegram"
+// namespace since this is about linking a Telegram account, not
+// authenticating a request. Checks authBotReady (not serverReady) so a
+// slow/broken broadcast pool can never block login/2FA linking.
+app.get('/api/telegram/connect', authenticateToken, function(req, res) {
   const bot = botPool.authBot;
   if (!bot || !bot.username) {
     return res.status(503).json({ error: 'Auth bot not ready yet, try again shortly.' });
