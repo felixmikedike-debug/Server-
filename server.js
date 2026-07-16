@@ -918,8 +918,15 @@ app.get('/api/auth/me', authenticateToken, function(req, res) {
 app.get('/api/telegram/connect', authenticateToken, function(req, res) {
   const bot = botPool.authBot;
   if (!bot || !bot.username) {
+    console.warn(
+      '[telegram/connect] 503 — auth bot not ready. userId=' + req.user.id +
+      ' authBotReady=' + authBotReady +
+      ' botPool.authBot=' + (bot ? 'set' : 'null') +
+      ' username=' + (bot && bot.username ? bot.username : 'none')
+    );
     return res.status(503).json({ error: 'Auth bot not ready yet, try again shortly.' });
   }
+  console.log('[telegram/connect] 200 — link issued for userId=' + req.user.id + ' bot=@' + bot.username);
   return res.json({
     success: true,
     startLink: 'https://t.me/' + bot.username + '?start=' + req.user.id,
@@ -1818,6 +1825,7 @@ app.get('/ping', function(req, res) {
 });
 
 app.use(function(req, res) {
+  console.warn('[404] No route matched: ' + req.method + ' ' + req.originalUrl);
   res.status(404).render('404');
 });
 
