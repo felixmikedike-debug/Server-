@@ -1818,6 +1818,14 @@ process.on('SIGINT', async function() {
   process.exit(0);
 });
 
+// Render (and any uptime monitor) pings bare GET/HEAD / by default.
+// Without an explicit route here it falls through to the 404 catch-all
+// and spams the deploy logs every few seconds — this is just a cheap,
+// no-DB-touching health response so that noise stops.
+app.get('/', function(req, res) {
+  res.status(200).type('text/plain').send('Sendm is running [' + BUILD_TAG + ']');
+});
+
 app.get('/ping', function(req, res) {
   if (!authBotReady) return res.status(503).type('text/plain').send('auth bot starting up [' + BUILD_TAG + ']');
   if (!serverReady) return res.status(200).type('text/plain').send('auth ok, broadcast pool starting [' + BUILD_TAG + ']');
