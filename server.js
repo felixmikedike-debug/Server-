@@ -17,7 +17,7 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-const BUILD_TAG = 'telegram-connect-route-2026-07-17-botindex-v1';
+const BUILD_TAG = 'telegram-connect-route-2026-07-18-signedbroadcast-v1';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
@@ -444,6 +444,28 @@ function prepareTelegramMessage(raw) {
   return sanitizeTelegramHtml(msg);
 }
 
+// Converts plain ASCII letters/digits to Unicode "Mathematical Sans-Serif Bold"
+// code points. This is the closest Telegram gets to a "beautiful custom font" —
+// Telegram's message formatting has no font-family concept, so this swaps the
+// actual characters for bold-styled Unicode look-alikes instead. Anything that
+// isn't a plain a-z/A-Z/0-9 character (emoji, punctuation, accents) passes through
+// unchanged.
+function toBoldSansUnicode(str) {
+  if (!str) return '';
+  const upperBase = 0x1D5D4; // 𝗔
+  const lowerBase = 0x1D5EE; // 𝗮
+  const digitBase = 0x1D7EC; // 𝟬
+  let out = '';
+  for (const ch of str) {
+    const code = ch.codePointAt(0);
+    if (code >= 65 && code <= 90) out += String.fromCodePoint(upperBase + (code - 65));
+    else if (code >= 97 && code <= 122) out += String.fromCodePoint(lowerBase + (code - 97));
+    else if (code >= 48 && code <= 57) out += String.fromCodePoint(digitBase + (code - 48));
+    else out += ch;
+  }
+  return out;
+}
+
 function splitTelegramMessage(text) {
   if (!text) return [];
   const chunks = [];
@@ -689,7 +711,19 @@ async function processBroadcast(job) {
   const userId = job.data.userId;
   const message = job.data.message;
   const broadcastId = job.data.broadcastId;
-  const chunks = splitTelegramMessage(message);
+
+  // Fetch the user once, up front — used both to build the "From <Name>"
+  // signature on the outgoing message and to send the delivery report DM.
+  const user = await User.findOne({ id: userId });
+
+  const firstName = (user && user.fullName ? user.fullName.trim() : '').split(' ')[0] || 'Sendm';
+  const senderName = toBoldSansUnicode(firstName);
+
+  // Signature is prepended ONCE, before splitting into chunks, so it only
+  // ever appears at the very top of the first message part — never repeated
+  // on "(2/3)"-style continuation chunks.
+  const signedMessage = '✨ From ' + senderName + '\n\n' + message;
+  const chunks = splitTelegramMessage(signedMessage);
 
   const targets = await Contact.find({
     userId: userId,
@@ -712,8 +746,8 @@ async function processBroadcast(job) {
     }
   }
 
-  const user = await User.findOne({ id: userId });
   let reportText = broadcastId ? '<b>Scheduled Broadcast Report</b>\n\n' : '<b>Broadcast Report</b>\n\n';
+  reportText += 'Sent as: <b>' + senderName + '</b>\n\n';
   if (total === 0) {
     reportText += 'No subscribed contacts with Telegram connected.';
   } else {
