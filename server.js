@@ -17,7 +17,7 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-const BUILD_TAG = 'telegram-connect-route-2026-07-18-signedbroadcast-v1';
+const BUILD_TAG = 'telegram-connect-route-2026-07-18-perbotlimiter-v1';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
@@ -62,7 +62,12 @@ const MONTHLY_PRICE_KOBO = 150000; // ₦5,000 in kobo
 const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
 const MAX_MSG_LENGTH = 4000;
 const BATCH_SIZE = 25;
-const BATCH_INTERVAL_MS = 8000;
+// Lowered from 8000 -> 2000ms. Safe to lower because message-level pacing
+// is now handled by the PER-BOT rate limiter below (which is what actually
+// protects each bot token from Telegram's ~30 msg/sec ceiling), not by this
+// inter-batch sleep. This interval now just avoids hammering Mongo/Redis
+// with back-to-back batch reads for very large lists.
+const BATCH_INTERVAL_MS = 2000;
 
 // ==================== REDIS + BULLMQ ====================
 let redisConnection;
@@ -385,6 +390,87 @@ async function setupBroadcastWebhooks() {
   console.log('Broadcast webhooks registered.');
 }
 
+// ==================== PER-BOT RATE LIMITER ====================
+// WHY THIS EXISTS: the bot pool is SHARED across every user on the platform.
+// Two different users' contacts can land on the exact same bot token (same
+// botIndex), and BullMQ runs up to `concurrency: 4` broadcast jobs at once.
+// Without a gate here, two users broadcasting at the same moment could push
+// 50+ simultaneous sendMessage calls through one bot token, blowing past
+// Telegram's ~30 msg/sec-per-bot ceiling and causing silent 429 failures
+// that used to just get marked "failed" with no retry.
+//
+// This is a token-bucket limiter keyed PER BOT INDEX (not per job, not per
+// user) so it correctly throttles the shared resource regardless of which
+// job or which user is sending through it.
+const BOT_RATE_LIMIT_PER_SEC = 25; // stay safely under Telegram's ~30/sec ceiling per bot
+const botRateLimiters = new Map(); // botIndex -> { tokens, lastRefill, queue }
+
+function getBotLimiter(botIndex) {
+  let limiter = botRateLimiters.get(botIndex);
+  if (!limiter) {
+    limiter = { tokens: BOT_RATE_LIMIT_PER_SEC, lastRefill: Date.now(), queue: [] };
+    botRateLimiters.set(botIndex, limiter);
+  }
+  return limiter;
+}
+
+function refillBotLimiter(limiter) {
+  const now = Date.now();
+  if (now - limiter.lastRefill >= 1000) {
+    limiter.tokens = BOT_RATE_LIMIT_PER_SEC;
+    limiter.lastRefill = now;
+  }
+}
+
+function drainBotLimiterQueue(botIndex) {
+  const limiter = getBotLimiter(botIndex);
+  refillBotLimiter(limiter);
+  while (limiter.tokens > 0 && limiter.queue.length > 0) {
+    limiter.tokens--;
+    const resolve = limiter.queue.shift();
+    resolve();
+  }
+  if (limiter.queue.length > 0) {
+    setTimeout(function() { drainBotLimiterQueue(botIndex); }, 100);
+  }
+}
+
+// Every single Telegram send for a given bot MUST pass through here first.
+// Resolves immediately if a token is available, otherwise queues and waits.
+function acquireBotSlot(botIndex) {
+  return new Promise(function(resolve) {
+    const limiter = getBotLimiter(botIndex);
+    refillBotLimiter(limiter);
+    if (limiter.tokens > 0) {
+      limiter.tokens--;
+      resolve();
+    } else {
+      limiter.queue.push(resolve);
+      setTimeout(function() { drainBotLimiterQueue(botIndex); }, 100);
+    }
+  });
+}
+
+// Sends one chunk through the rate limiter, with automatic retry-on-429
+// using Telegram's own retry_after hint instead of just giving up and
+// marking the contact as "failed" in the delivery report.
+async function sendChunkWithLimiterAndRetry(entry, chatId, chunk, attempt) {
+  if (!attempt) attempt = 1;
+  await acquireBotSlot(entry.index);
+  try {
+    await entry.bot.telegram.sendMessage(chatId, chunk, { parse_mode: 'HTML' });
+  } catch (err) {
+    const is429 = err.response && err.response.error_code === 429;
+    if (is429 && attempt <= 3) {
+      const retryAfter = (err.response.parameters && err.response.parameters.retry_after) || 2;
+      console.warn('Bot[' + entry.index + '] 429 — retrying in ' + retryAfter + 's (attempt ' + attempt + '/3)');
+      await new Promise(function(r) { setTimeout(r, (retryAfter + 0.5) * 1000); });
+      return sendChunkWithLimiterAndRetry(entry, chatId, chunk, attempt + 1);
+    }
+    throw err;
+  }
+}
+
 // ==================== TEXT / HTML UTILITIES ====================
 function escapeHtml(unsafe) {
   if (!unsafe) unsafe = '';
@@ -681,8 +767,12 @@ async function sendToContact(contact, chunks) {
     entry = botPool.getBotForContact(contact.contact);
   }
   if (!entry) throw new Error('No broadcast bot available for contact ' + contact.contact);
+
+  // Every chunk goes through the per-bot rate limiter + 429 retry. This is
+  // what protects a shared bot token from being overloaded when multiple
+  // users' broadcasts land on it at the same time.
   for (const chunk of chunks) {
-    await entry.bot.telegram.sendMessage(contact.telegramChatId, chunk, { parse_mode: 'HTML' });
+    await sendChunkWithLimiterAndRetry(entry, contact.telegramChatId, chunk);
   }
 }
 
@@ -1167,7 +1257,7 @@ app.post('/api/subscription/webhook', async function(req, res) {
 });
 
 app.get('/subscription-success', function(req, res) {
-  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>✓ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendi.onrender.com">← Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
+  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>✓ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendmi.onrender.com">← Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
 });
 
 // ==================== CACHED HIGH-READ ENDPOINTS ====================
