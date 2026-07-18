@@ -17,7 +17,7 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-const BUILD_TAG = 'telegram-connect-route-2026-07-16-v2';
+const BUILD_TAG = 'telegram-connect-route-2026-07-17-botindex-v1';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
@@ -119,6 +119,9 @@ const formPageSchema = new mongoose.Schema({
   welcomeMessage: String,
 }, { timestamps: true });
 
+// NOTE: botIndex is assigned ONCE at signup time and never recomputed.
+// This is what makes it safe to add/remove bots from BROADCAST_BOT_TOKENS
+// later without breaking delivery to contacts who already connected.
 const contactSchema = new mongoose.Schema({
   userId: { type: String, required: true },
   shortId: String,
@@ -126,6 +129,7 @@ const contactSchema = new mongoose.Schema({
   contact: { type: String, required: true },
   telegramChatId: String,
   telegramUsername: String,
+  botIndex: { type: Number, default: null },
   status: { type: String, default: 'pending' },
   submittedAt: Date,
   subscribedAt: Date,
@@ -138,6 +142,7 @@ const pendingSubscriberSchema = new mongoose.Schema({
   shortId: String,
   name: String,
   contact: { type: String, required: true },
+  botIndex: { type: Number, required: true }, // carries the locked-in assignment from subscribe -> bot start
   createdAt: { type: Date, default: Date.now, expires: 1800 } // 30 min TTL
 });
 
@@ -188,6 +193,7 @@ contactSchema.index({ userId: 1 });
 contactSchema.index({ userId: 1, contact: 1 });
 contactSchema.index({ userId: 1, status: 1 });
 contactSchema.index({ status: 1 });
+contactSchema.index({ botIndex: 1 });
 landingPageSchema.index({ userId: 1 });
 formPageSchema.index({ userId: 1 });
 scheduledBroadcastSchema.index({ userId: 1 });
@@ -260,6 +266,8 @@ const botPool = {
     return this.broadcastBots.length;
   },
 
+  // Used ONLY at signup time to assign a brand-new contact to a bot.
+  // Never used again for that contact after assignment — see contact.botIndex.
   getBotForContact(contactValue) {
     if (this.poolSize === 0) return null;
     const hash = crypto.createHash('md5').update(String(contactValue).toLowerCase().trim()).digest('hex');
@@ -583,6 +591,7 @@ function registerBroadcastBotHandlers(bot, botIndex) {
         contact: pending.contact,
         telegramChatId: chatId,
         telegramUsername: tgUsername,
+        botIndex: pending.botIndex, // locked-in assignment from signup time, never recomputed
         status: 'subscribed',
         submittedAt: new Date(),
         subscribedAt: new Date()
@@ -593,6 +602,11 @@ function registerBroadcastBotHandlers(bot, botIndex) {
       targetContact.shortId = pending.shortId;
       targetContact.telegramChatId = chatId;
       targetContact.telegramUsername = tgUsername;
+      // Only set botIndex if this contact doesn't already have one (e.g. legacy record).
+      // If it already has one, keep it — this contact's Telegram session lives with that bot.
+      if (targetContact.botIndex == null) {
+        targetContact.botIndex = pending.botIndex;
+      }
       targetContact.status = 'subscribed';
       targetContact.subscribedAt = targetContact.subscribedAt || new Date();
       targetContact.submittedAt = new Date();
@@ -633,8 +647,18 @@ function registerBroadcastBotHandlers(bot, botIndex) {
 
 // ==================== BROADCAST WORKER ====================
 async function sendToContact(contact, chunks) {
-  const entry = botPool.getBotForContact(contact.contact);
-  if (!entry) throw new Error('No broadcast bot available (pool empty) for contact ' + contact.contact);
+  // ALWAYS use the locked-in botIndex stored on the contact. Never recompute
+  // via hash here — that's what breaks when the pool size changes.
+  let entry = null;
+  if (contact.botIndex != null) {
+    entry = botPool.getBroadcastBotByIndex(contact.botIndex);
+  }
+  if (!entry) {
+    // Fallback path only for legacy contacts saved before botIndex existed
+    // and never backfilled. Run backfillBotIndexes() to eliminate this path.
+    entry = botPool.getBotForContact(contact.contact);
+  }
+  if (!entry) throw new Error('No broadcast bot available for contact ' + contact.contact);
   for (const chunk of chunks) {
     await entry.bot.telegram.sendMessage(contact.telegramChatId, chunk, { parse_mode: 'HTML' });
   }
@@ -739,6 +763,29 @@ worker.on('failed', async function(job, err) {
     } catch (e) {}
   }
 });
+
+// ==================== ONE-TIME MIGRATION: backfill botIndex on legacy contacts ====================
+// Run once at startup (safe to leave in — it's a no-op once everything has botIndex set).
+// Assigns a botIndex to any existing contact that doesn't have one yet, using the
+// CURRENT hash-based lookup as a best-effort match to whichever bot they're likely
+// already talking to. After this runs once, sendToContact never needs the fallback.
+async function backfillBotIndexes() {
+  const contacts = await Contact.find({ botIndex: null, telegramChatId: { $ne: null } });
+  if (contacts.length === 0) {
+    console.log('✓ No legacy contacts need botIndex backfill');
+    return;
+  }
+  let updated = 0;
+  for (const c of contacts) {
+    const entry = botPool.getBotForContact(c.contact);
+    if (entry) {
+      c.botIndex = entry.index;
+      await c.save();
+      updated++;
+    }
+  }
+  console.log('✓ Backfilled botIndex for ' + updated + '/' + contacts.length + ' legacy contact(s)');
+}
 
 // ==================== SCHEDULED BROADCAST RECOVERY AFTER RESTART ====================
 async function recoverLostScheduledBroadcasts() {
@@ -1385,11 +1432,14 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
     const owner = await User.findOne({ id: form.userId });
     if (!owner) return res.status(400).json({ error: 'Form owner not found' });
 
+    // Compute the bot assignment ONCE here. This is the only place a fresh
+    // hash-based assignment should ever happen. Once stored (below), it's locked.
     const broadcastBotEntry = botPool.getBotForContact(contactValue);
     if (!broadcastBotEntry) {
       console.error('No broadcast bot available (pool empty) for contact ' + contactValue + ' (owner ' + owner.id + ')');
       return res.status(503).json({ error: 'Unable to assign a broadcast bot right now. Please try again shortly.' });
     }
+    const freshAssignedIndex = broadcastBotEntry.index;
 
     const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
 
@@ -1397,20 +1447,31 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
     if (contact) {
       if (contact.status === 'subscribed') {
+        // Already subscribed elsewhere — keep their EXISTING bot assignment if they
+        // have one, don't silently move them to whatever the hash says today.
+        const lockedIndex = contact.botIndex != null ? contact.botIndex : freshAssignedIndex;
+
         contact.name = name.trim();
         contact.shortId = shortId;
         contact.submittedAt = new Date();
+        if (contact.botIndex == null) contact.botIndex = lockedIndex;
         await contact.save();
 
-        await PendingSubscriber.create({ payload: payload, userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue });
+        await PendingSubscriber.create({
+          payload: payload, userId: owner.id, shortId: shortId,
+          name: name.trim(), contact: contactValue, botIndex: lockedIndex
+        });
 
-        const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
+        const botForLink = botPool.getBroadcastBotByIndex(lockedIndex) || broadcastBotEntry;
+        const deepLink = 'https://t.me/' + botForLink.username + '?start=' + payload;
         return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
       }
 
+      // Not currently subscribed (pending/unsubscribed) — fresh assignment is fine.
       contact.name = name.trim();
       contact.shortId = shortId;
       contact.submittedAt = new Date();
+      contact.botIndex = freshAssignedIndex;
     } else {
       contact = new Contact({
         userId: owner.id,
@@ -1418,12 +1479,16 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
         name: name.trim(),
         contact: contactValue,
         status: 'pending',
+        botIndex: freshAssignedIndex,
         submittedAt: new Date()
       });
     }
     await contact.save();
 
-    await PendingSubscriber.create({ payload: payload, userId: owner.id, shortId: shortId, name: name.trim(), contact: contactValue });
+    await PendingSubscriber.create({
+      payload: payload, userId: owner.id, shortId: shortId,
+      name: name.trim(), contact: contactValue, botIndex: freshAssignedIndex
+    });
 
     const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
     res.json({ success: true, deepLink: deepLink });
@@ -1793,6 +1858,9 @@ mongoose.connection.once('open', async function() {
       registerBroadcastBotHandlers(entry.bot, entry.index);
     });
     await setupBroadcastWebhooks();
+
+    // Backfill botIndex on any legacy contacts before anything else touches them.
+    await backfillBotIndexes();
 
     await recoverLostScheduledBroadcasts();
 
