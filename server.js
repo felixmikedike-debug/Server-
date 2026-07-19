@@ -273,9 +273,20 @@ const botPool = {
 
   // Used ONLY at signup time to assign a brand-new contact to a bot.
   // Never used again for that contact after assignment — see contact.botIndex.
-  getBotForContact(contactValue) {
+  //
+  // IMPORTANT: the hash key is `userId:contactValue`, NOT just contactValue.
+  // If it were only contactValue, the same physical person subscribing to
+  // two different creators would ALWAYS land on the identical bot index
+  // (same email/phone hashes the same way every time) — meaning both
+  // creators' broadcasts would land in the SAME Telegram chat, looking like
+  // one bot randomly sending unrelated content from different "senders."
+  // Keying by userId+contact spreads different creators' relationships with
+  // the same subscriber across different bots, so each creator gets what
+  // looks like its own independent bot chat with that person.
+  getBotForContact(userId, contactValue) {
     if (this.poolSize === 0) return null;
-    const hash = crypto.createHash('md5').update(String(contactValue).toLowerCase().trim()).digest('hex');
+    const key = String(userId) + ':' + String(contactValue).toLowerCase().trim();
+    const hash = crypto.createHash('md5').update(key).digest('hex');
     const n = parseInt(hash.slice(0, 8), 16);
     const idx = n % this.poolSize;
     return this.broadcastBots[idx] || null;
@@ -764,7 +775,7 @@ async function sendToContact(contact, chunks) {
   if (!entry) {
     // Fallback path only for legacy contacts saved before botIndex existed
     // and never backfilled. Run backfillBotIndexes() to eliminate this path.
-    entry = botPool.getBotForContact(contact.contact);
+    entry = botPool.getBotForContact(contact.userId, contact.contact);
   }
   if (!entry) throw new Error('No broadcast bot available for contact ' + contact.contact);
 
@@ -901,7 +912,7 @@ async function backfillBotIndexes() {
   }
   let updated = 0;
   for (const c of contacts) {
-    const entry = botPool.getBotForContact(c.contact);
+    const entry = botPool.getBotForContact(c.userId, c.contact);
     if (entry) {
       c.botIndex = entry.index;
       await c.save();
@@ -1558,7 +1569,8 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
     // Compute the bot assignment ONCE here. This is the only place a fresh
     // hash-based assignment should ever happen. Once stored (below), it's locked.
-    const broadcastBotEntry = botPool.getBotForContact(contactValue);
+    // Keyed by owner.id + contactValue — see getBotForContact for why.
+    const broadcastBotEntry = botPool.getBotForContact(owner.id, contactValue);
     if (!broadcastBotEntry) {
       console.error('No broadcast bot available (pool empty) for contact ' + contactValue + ' (owner ' + owner.id + ')');
       return res.status(503).json({ error: 'Unable to assign a broadcast bot right now. Please try again shortly.' });
