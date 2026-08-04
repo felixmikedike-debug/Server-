@@ -17,7 +17,7 @@ const { Queue, Worker } = require('bullmq');
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
 // server actually running is the version you think it is.
-const BUILD_TAG = 'telegram-connect-route-2026-07-18-perbotlimiter-v1';
+const BUILD_TAG = 'telegram-connect-route-2026-08-04-inputvalidation-v1';
 
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
@@ -52,14 +52,57 @@ if (!WEBHOOK_SECRET || !WEBHOOK_SECRET.trim()) {
 }
 
 if (JWT_SECRET.includes('fallback')) {
-  console.warn('⚠️  WARNING: JWT_SECRET not set in .env! Using insecure fallback.');
+  console.warn('âš ï¸  WARNING: JWT_SECRET not set in .env! Using insecure fallback.');
 }
 if (PAYSTACK_SECRET_KEY.startsWith('sk_test_fallback')) {
-  console.warn('⚠️  WARNING: PAYSTACK_SECRET_KEY not set in .env!');
+  console.warn('âš ï¸  WARNING: PAYSTACK_SECRET_KEY not set in .env!');
 }
 
-const MONTHLY_PRICE_KOBO = 150000; // ₦5,000 in kobo
-const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
+const MONTHLY_PRICE_KOBO = 150000; // â‚¦5,000 in kobo
+
+// ==================== INPUT VALIDATION: LENGTH CAPS & CHARACTER RULES ====================
+// Centralized here so every route that accepts free-text user input enforces
+// a sane upper bound BEFORE that value touches the DB, gets hashed, or gets
+// echoed into a rendered page / outgoing Telegram message. Unbounded strings
+// are a cheap DoS vector (huge bcrypt hashes, huge broadcast signatures,
+// huge rendered pages) even when they're not "malicious" in a script-injection
+// sense.
+
+// Human name (contact form name, account fullName). Unicode letters/marks so
+// non-Latin-script names aren't blocked, plus spaces/hyphens/apostrophes/periods
+// for things like "Mary-Jane", "O'Brien", "J.R.".
+const NAME_MAX_LENGTH = 80;
+const NAME_REGEX = /^[\p{L}\p{M}\s.'-]{1,80}$/u;
+
+// Email: reasonable RFC-ish check + hard length cap (matches common practical
+// limits; local part + @ + domain kept well under mail-system maximums).
+const EMAIL_MAX_LENGTH = 254;
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,24}$/;
+
+// Contact field on subscribe forms accepts EITHER a phone number OR an email.
+// Phone branch was already capped (7-20 chars); email branch previously had
+// no upper bound at all, so a huge string ending in "@x.co" would pass.
+const CONTACT_REGEX = new RegExp(
+  '^(\\+?[0-9\\s\\-\\(\\)]{7,20}|[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9.-]{1,190}\\.[a-zA-Z]{2,24})$'
+);
+
+// Passwords: bcrypt silently truncates at 72 BYTES, so anything beyond that
+// is wasted (and hashing a multi-KB/MB string first is needless CPU work an
+// attacker can abuse). Keep a generous but firm ceiling, plus the existing
+// minimum of 6 used at reset time, applied consistently everywhere.
+const PASSWORD_MIN_LENGTH = 6;
+const PASSWORD_MAX_LENGTH = 72;
+
+// Titles for landing pages / forms - shown in dashboards and rendered pages.
+const TITLE_MAX_LENGTH = 150;
+
+// Welcome message sent to new subscribers via Telegram.
+const WELCOME_MESSAGE_MAX_LENGTH = 2000;
+
+// Bulk contact deletion - cap how many contacts can be sent in one request
+// so a single call can't force a huge $in query.
+const CONTACTS_DELETE_MAX = 1000;
+
 const MAX_MSG_LENGTH = 4000;
 const BATCH_SIZE = 25;
 // Lowered from 8000 -> 2000ms. Safe to lower because message-level pacing
@@ -69,12 +112,64 @@ const BATCH_SIZE = 25;
 // with back-to-back batch reads for very large lists.
 const BATCH_INTERVAL_MS = 2000;
 
+function isNonEmptyString(val) {
+  return typeof val === 'string' && val.trim().length > 0;
+}
+
+// Validates + trims a human name field (contact form name, account fullName).
+// Returns { ok: true, value } or { ok: false, error }.
+function validateName(raw, fieldLabel) {
+  if (!isNonEmptyString(raw)) return { ok: false, error: (fieldLabel || 'Name') + ' is required' };
+  const trimmed = raw.trim();
+  if (trimmed.length > NAME_MAX_LENGTH) {
+    return { ok: false, error: (fieldLabel || 'Name') + ' must be ' + NAME_MAX_LENGTH + ' characters or fewer' };
+  }
+  if (!NAME_REGEX.test(trimmed)) {
+    return { ok: false, error: (fieldLabel || 'Name') + ' contains invalid characters' };
+  }
+  return { ok: true, value: trimmed };
+}
+
+// Validates + normalizes an email field.
+function validateEmail(raw) {
+  if (!isNonEmptyString(raw)) return { ok: false, error: 'Email is required' };
+  const trimmed = raw.trim().toLowerCase();
+  if (trimmed.length > EMAIL_MAX_LENGTH) {
+    return { ok: false, error: 'Email must be ' + EMAIL_MAX_LENGTH + ' characters or fewer' };
+  }
+  if (!EMAIL_REGEX.test(trimmed)) {
+    return { ok: false, error: 'Please provide a valid email address' };
+  }
+  return { ok: true, value: trimmed };
+}
+
+// Validates a password's length (used both at registration and reset).
+function validatePasswordLength(raw) {
+  if (typeof raw !== 'string' || raw.length < PASSWORD_MIN_LENGTH) {
+    return { ok: false, error: 'Password must be at least ' + PASSWORD_MIN_LENGTH + ' characters' };
+  }
+  if (raw.length > PASSWORD_MAX_LENGTH) {
+    return { ok: false, error: 'Password must be ' + PASSWORD_MAX_LENGTH + ' characters or fewer' };
+  }
+  return { ok: true, value: raw };
+}
+
+// Validates a title field (landing pages / forms).
+function validateTitle(raw) {
+  if (!isNonEmptyString(raw)) return { ok: false, error: 'Title is required' };
+  const trimmed = raw.trim();
+  if (trimmed.length > TITLE_MAX_LENGTH) {
+    return { ok: false, error: 'Title must be ' + TITLE_MAX_LENGTH + ' characters or fewer' };
+  }
+  return { ok: true, value: trimmed };
+}
+
 // ==================== REDIS + BULLMQ ====================
 let redisConnection;
 if (process.env.REDIS_URL) {
   redisConnection = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: false });
 } else {
-  console.warn('⚠️ WARNING: REDIS_URL not set in .env, falling back to localhost:6379');
+  console.warn('âš ï¸ WARNING: REDIS_URL not set in .env, falling back to localhost:6379');
   redisConnection = new IORedis({ host: 'localhost', port: 6379, maxRetriesPerRequest: null, enableReadyCheck: false });
 }
 const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
@@ -88,7 +183,7 @@ mongoose.connect(MONGODB_URI, {
   socketTimeoutMS: 45000,
   connectTimeoutMS: 30000,
 }).then(function() {
-  console.log('✅ MongoDB connected');
+  console.log('âœ… MongoDB connected');
 }).catch(function(err) {
   console.error('MongoDB connection failed:', err.message);
   process.exit(1);
@@ -255,7 +350,7 @@ setInterval(function() {
   for (const [userId, bucket] of userCache.entries()) {
     if (now - bucket.lastAccess > INACTIVE_THRESHOLD) {
       userCache.delete(userId);
-      console.log('🧹 Cleaned cache for inactive user: ' + userId);
+      console.log('ðŸ§¹ Cleaned cache for inactive user: ' + userId);
     }
   }
 }, 10 * 60 * 1000);
@@ -272,12 +367,12 @@ const botPool = {
   },
 
   // Used ONLY at signup time to assign a brand-new contact to a bot.
-  // Never used again for that contact after assignment — see contact.botIndex.
+  // Never used again for that contact after assignment â€” see contact.botIndex.
   //
   // IMPORTANT: the hash key is `userId:contactValue`, NOT just contactValue.
   // If it were only contactValue, the same physical person subscribing to
   // two different creators would ALWAYS land on the identical bot index
-  // (same email/phone hashes the same way every time) — meaning both
+  // (same email/phone hashes the same way every time) â€” meaning both
   // creators' broadcasts would land in the SAME Telegram chat, looking like
   // one bot randomly sending unrelated content from different "senders."
   // Keying by userId+contact spreads different creators' relationships with
@@ -314,7 +409,7 @@ async function getMeWithRetry(bot, label, maxAttempts) {
 
 async function initAuthBot() {
   const authToken = process.env.AUTH_BOT_TOKEN;
-  if (!authToken) throw new Error('AUTH_BOT_TOKEN is required — the auth bot is not optional.');
+  if (!authToken) throw new Error('AUTH_BOT_TOKEN is required â€” the auth bot is not optional.');
 
   const authBot = new Telegraf(authToken);
   authBot.webhookReply = false;
@@ -332,7 +427,7 @@ async function initBroadcastPool() {
     .split(',').map(function(t) { return t.trim(); }).filter(Boolean);
 
   if (rawBroadcastTokens.length === 0) {
-    throw new Error('BROADCAST_BOT_TOKENS is required — need at least 1 broadcast bot, recommend 3-4.');
+    throw new Error('BROADCAST_BOT_TOKENS is required â€” need at least 1 broadcast bot, recommend 3-4.');
   }
 
   for (let i = 0; i < rawBroadcastTokens.length; i++) {
@@ -474,7 +569,7 @@ async function sendChunkWithLimiterAndRetry(entry, chatId, chunk, attempt) {
     const is429 = err.response && err.response.error_code === 429;
     if (is429 && attempt <= 3) {
       const retryAfter = (err.response.parameters && err.response.parameters.retry_after) || 2;
-      console.warn('Bot[' + entry.index + '] 429 — retrying in ' + retryAfter + 's (attempt ' + attempt + '/3)');
+      console.warn('Bot[' + entry.index + '] 429 â€” retrying in ' + retryAfter + 's (attempt ' + attempt + '/3)');
       await new Promise(function(r) { setTimeout(r, (retryAfter + 0.5) * 1000); });
       return sendChunkWithLimiterAndRetry(entry, chatId, chunk, attempt + 1);
     }
@@ -542,16 +637,16 @@ function prepareTelegramMessage(raw) {
 }
 
 // Converts plain ASCII letters/digits to Unicode "Mathematical Sans-Serif Bold"
-// code points. This is the closest Telegram gets to a "beautiful custom font" —
+// code points. This is the closest Telegram gets to a "beautiful custom font" â€”
 // Telegram's message formatting has no font-family concept, so this swaps the
 // actual characters for bold-styled Unicode look-alikes instead. Anything that
 // isn't a plain a-z/A-Z/0-9 character (emoji, punctuation, accents) passes through
 // unchanged.
 function toBoldSansUnicode(str) {
   if (!str) return '';
-  const upperBase = 0x1D5D4; // 𝗔
-  const lowerBase = 0x1D5EE; // 𝗮
-  const digitBase = 0x1D7EC; // 𝟬
+  const upperBase = 0x1D5D4; // ð—”
+  const lowerBase = 0x1D5EE; // ð—®
+  const digitBase = 0x1D7EC; // ðŸ¬
   let out = '';
   for (const ch of str) {
     const code = ch.codePointAt(0);
@@ -627,7 +722,7 @@ async function send2FACodeViaBot(user, code) {
   try {
     await botPool.authBot.telegram.sendMessage(
       user.telegramChatId,
-      'Security Alert – Password Reset\n\nYour 6-digit code:\n\n<b>' + code + '</b>\n\nValid for 10 minutes.',
+      'Security Alert â€“ Password Reset\n\nYour 6-digit code:\n\n<b>' + code + '</b>\n\nValid for 10 minutes.',
       { parse_mode: 'HTML' }
     );
     return true;
@@ -722,7 +817,7 @@ function registerBroadcastBotHandlers(bot, botIndex) {
       targetContact.telegramChatId = chatId;
       targetContact.telegramUsername = tgUsername;
       // Only set botIndex if this contact doesn't already have one (e.g. legacy record).
-      // If it already has one, keep it — this contact's Telegram session lives with that bot.
+      // If it already has one, keep it â€” this contact's Telegram session lives with that bot.
       if (targetContact.botIndex == null) {
         targetContact.botIndex = pending.botIndex;
       }
@@ -767,7 +862,7 @@ function registerBroadcastBotHandlers(bot, botIndex) {
 // ==================== BROADCAST WORKER ====================
 async function sendToContact(contact, chunks) {
   // ALWAYS use the locked-in botIndex stored on the contact. Never recompute
-  // via hash here — that's what breaks when the pool size changes.
+  // via hash here â€” that's what breaks when the pool size changes.
   let entry = null;
   if (contact.botIndex != null) {
     entry = botPool.getBroadcastBotByIndex(contact.botIndex);
@@ -813,7 +908,7 @@ async function processBroadcast(job) {
   const message = job.data.message;
   const broadcastId = job.data.broadcastId;
 
-  // Fetch the user once, up front — used both to build the "From <Name>"
+  // Fetch the user once, up front â€” used both to build the "From <Name>"
   // signature on the outgoing message and to send the delivery report DM.
   const user = await User.findOne({ id: userId });
 
@@ -821,9 +916,9 @@ async function processBroadcast(job) {
   const senderName = toBoldSansUnicode(firstName);
 
   // Signature is prepended ONCE, before splitting into chunks, so it only
-  // ever appears at the very top of the first message part — never repeated
+  // ever appears at the very top of the first message part â€” never repeated
   // on "(2/3)"-style continuation chunks.
-  const signedMessage = '✨ From ' + senderName + '\n\n' + message;
+  const signedMessage = 'âœ¨ From ' + senderName + '\n\n' + message;
   const chunks = splitTelegramMessage(signedMessage);
 
   const targets = await Contact.find({
@@ -852,7 +947,7 @@ async function processBroadcast(job) {
   if (total === 0) {
     reportText += 'No subscribed contacts with Telegram connected.';
   } else {
-    const emoji = stats.failed === 0 ? '✅' : '⚠️';
+    const emoji = stats.failed === 0 ? 'âœ…' : 'âš ï¸';
     reportText += emoji + ' <b>' + stats.sent + ' of ' + total + '</b> delivered.\n';
     if (stats.failed > 0) reportText += stats.failed + ' failed.';
   }
@@ -900,14 +995,14 @@ worker.on('failed', async function(job, err) {
 });
 
 // ==================== ONE-TIME MIGRATION: backfill botIndex on legacy contacts ====================
-// Run once at startup (safe to leave in — it's a no-op once everything has botIndex set).
+// Run once at startup (safe to leave in â€” it's a no-op once everything has botIndex set).
 // Assigns a botIndex to any existing contact that doesn't have one yet, using the
 // CURRENT hash-based lookup as a best-effort match to whichever bot they're likely
 // already talking to. After this runs once, sendToContact never needs the fallback.
 async function backfillBotIndexes() {
   const contacts = await Contact.find({ botIndex: null, telegramChatId: { $ne: null } });
   if (contacts.length === 0) {
-    console.log('✓ No legacy contacts need botIndex backfill');
+    console.log('âœ“ No legacy contacts need botIndex backfill');
     return;
   }
   let updated = 0;
@@ -919,12 +1014,12 @@ async function backfillBotIndexes() {
       updated++;
     }
   }
-  console.log('✓ Backfilled botIndex for ' + updated + '/' + contacts.length + ' legacy contact(s)');
+  console.log('âœ“ Backfilled botIndex for ' + updated + '/' + contacts.length + ' legacy contact(s)');
 }
 
 // ==================== SCHEDULED BROADCAST RECOVERY AFTER RESTART ====================
 async function recoverLostScheduledBroadcasts() {
-  console.log('🔄 Starting recovery of scheduled broadcasts after server restart...');
+  console.log('ðŸ”„ Starting recovery of scheduled broadcasts after server restart...');
 
   const now = new Date();
   const pendingFuture = await ScheduledBroadcast.find({
@@ -933,7 +1028,7 @@ async function recoverLostScheduledBroadcasts() {
   }).lean();
 
   if (pendingFuture.length === 0) {
-    console.log('✓ No pending future scheduled broadcasts need recovery');
+    console.log('âœ“ No pending future scheduled broadcasts need recovery');
     return;
   }
 
@@ -963,7 +1058,7 @@ async function recoverLostScheduledBroadcasts() {
     recovered++;
   }
 
-  console.log('✓ Recovery completed: ' + recovered + ' broadcast(s) re-queued, ' + alreadyExists + ' were already present in queue');
+  console.log('âœ“ Recovery completed: ' + recovered + ' broadcast(s) re-queued, ' + alreadyExists + ' were already present in queue');
 }
 
 // ==================== MIDDLEWARE ====================
@@ -1039,19 +1134,27 @@ const authenticateToken = async function(req, res, next) {
 
 // ==================== AUTH ROUTES ====================
 app.post('/api/auth/register', authLimiter, async function(req, res) {
-  const fullName = req.body.fullName;
-  const email = req.body.email;
-  const password = req.body.password;
-  if (!fullName || !email || !password) return res.status(400).json({ error: 'All fields required' });
+  const nameCheck = validateName(req.body.fullName, 'Full name');
+  if (!nameCheck.ok) return res.status(400).json({ error: nameCheck.error });
 
-  const existing = await User.findOne({ email: email.toLowerCase() });
+  const emailCheck = validateEmail(req.body.email);
+  if (!emailCheck.ok) return res.status(400).json({ error: emailCheck.error });
+
+  const passwordCheck = validatePasswordLength(req.body.password);
+  if (!passwordCheck.ok) return res.status(400).json({ error: passwordCheck.error });
+
+  const fullName = nameCheck.value;
+  const email = emailCheck.value;
+  const password = passwordCheck.value;
+
+  const existing = await User.findOne({ email: email });
   if (existing) return res.status(409).json({ error: 'Email already exists' });
 
   const hashed = await bcrypt.hash(password, 12);
   const newUser = await User.create({
     id: uuidv4(),
-    fullName: fullName.trim(),
-    email: email.toLowerCase(),
+    fullName: fullName,
+    email: email,
     password: hashed,
   });
 
@@ -1066,9 +1169,17 @@ app.post('/api/auth/register', authLimiter, async function(req, res) {
 app.post('/api/auth/login', authLimiter, async function(req, res) {
   const email = req.body.email;
   const password = req.body.password;
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+  // Cap lengths BEFORE hitting bcrypt.compare (which hashes the input) so an
+  // attacker can't force expensive hashing of a huge payload just by POSTing
+  // a giant "password" string.
+  if (email.length > EMAIL_MAX_LENGTH || password.length > PASSWORD_MAX_LENGTH) {
+    return res.status(400).json({ error: 'Invalid credentials' });
+  }
 
-  const user = await User.findOne({ email: email.toLowerCase() });
+  const user = await User.findOne({ email: email.toLowerCase().trim() });
   if (!user || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
@@ -1093,7 +1204,7 @@ app.get('/api/auth/me', authenticateToken, function(req, res) {
 });
 
 // Connect 2FA: deep link into the SHARED auth bot.
-// Route: /api/telegram/connect — grouped under its own "telegram"
+// Route: /api/telegram/connect â€” grouped under its own "telegram"
 // namespace since this is about linking a Telegram account, not
 // authenticating a request. Checks authBotReady (not serverReady) so a
 // slow/broken broadcast pool can never block login/2FA linking.
@@ -1101,14 +1212,14 @@ app.get('/api/telegram/connect', authenticateToken, function(req, res) {
   const bot = botPool.authBot;
   if (!bot || !bot.username) {
     console.warn(
-      '[telegram/connect] 503 — auth bot not ready. userId=' + req.user.id +
+      '[telegram/connect] 503 â€” auth bot not ready. userId=' + req.user.id +
       ' authBotReady=' + authBotReady +
       ' botPool.authBot=' + (bot ? 'set' : 'null') +
       ' username=' + (bot && bot.username ? bot.username : 'none')
     );
     return res.status(503).json({ error: 'Auth bot not ready yet, try again shortly.' });
   }
-  console.log('[telegram/connect] 200 — link issued for userId=' + req.user.id + ' bot=@' + bot.username);
+  console.log('[telegram/connect] 200 â€” link issued for userId=' + req.user.id + ' bot=@' + bot.username);
   return res.json({
     success: true,
     startLink: 'https://t.me/' + bot.username + '?start=' + req.user.id,
@@ -1129,9 +1240,11 @@ app.get('/api/auth/bot-status', authenticateToken, function(req, res) {
 
 app.post('/api/auth/forgot-password', async function(req, res) {
   const email = req.body.email;
-  if (!email) return res.status(400).json({ error: 'Email required' });
+  if (!isNonEmptyString(email) || email.length > EMAIL_MAX_LENGTH) {
+    return res.status(400).json({ error: 'Email required' });
+  }
 
-  const user = await User.findOne({ email: email.toLowerCase() });
+  const user = await User.findOne({ email: email.toLowerCase().trim() });
   if (!user) return res.json({ success: true, message: 'If account exists, code was sent.' });
   if (!user.isTelegramConnected) return res.status(400).json({ error: 'Telegram 2FA not connected' });
 
@@ -1148,7 +1261,12 @@ app.post('/api/auth/forgot-password', async function(req, res) {
 app.post('/api/auth/verify-reset-code', function(req, res) {
   const resetToken = req.body.resetToken;
   const code = req.body.code;
-  if (!resetToken || !code) return res.status(400).json({ error: 'Token and code required' });
+  if (!isNonEmptyString(resetToken) || !isNonEmptyString(code)) {
+    return res.status(400).json({ error: 'Token and code required' });
+  }
+  if (resetToken.length > 200 || code.length > 20) {
+    return res.status(400).json({ error: 'Invalid or expired code' });
+  }
 
   const entry = resetTokens.get(resetToken);
   if (!entry || Date.now() > entry.expiresAt) {
@@ -1162,8 +1280,13 @@ app.post('/api/auth/verify-reset-code', function(req, res) {
 
 app.post('/api/auth/reset-password', async function(req, res) {
   const resetToken = req.body.resetToken;
-  const newPassword = req.body.newPassword;
-  if (!resetToken || !newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Valid token and password required' });
+  if (!isNonEmptyString(resetToken) || resetToken.length > 200) {
+    return res.status(400).json({ error: 'Valid token and password required' });
+  }
+
+  const passwordCheck = validatePasswordLength(req.body.newPassword);
+  if (!passwordCheck.ok) return res.status(400).json({ error: passwordCheck.error });
+  const newPassword = passwordCheck.value;
 
   const entry = resetTokens.get(resetToken);
   if (!entry || Date.now() > entry.expiresAt) {
@@ -1268,7 +1391,7 @@ app.post('/api/subscription/webhook', async function(req, res) {
 });
 
 app.get('/subscription-success', function(req, res) {
-  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>✓ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendmi.onrender.com">← Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
+  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>âœ“ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendmi.onrender.com">â† Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
 });
 
 // ==================== CACHED HIGH-READ ENDPOINTS ====================
@@ -1424,9 +1547,12 @@ app.get('/api/form/:shortId', async function(req, res) {
 // ==================== LANDING PAGES WRITE ROUTES ====================
 app.post('/api/pages/save', authenticateToken, async function(req, res) {
   const shortId = req.body.shortId;
-  const title = req.body.title;
   const config = req.body.config;
-  if (!title || !config || !Array.isArray(config.blocks)) return res.status(400).json({ error: 'Title and config.blocks required' });
+  if (!config || !Array.isArray(config.blocks)) return res.status(400).json({ error: 'Title and config.blocks required' });
+
+  const titleCheck = validateTitle(req.body.title);
+  if (!titleCheck.ok) return res.status(400).json({ error: titleCheck.error });
+  const title = titleCheck.value;
 
   const limits = getUserLimits(req.user);
 
@@ -1451,7 +1577,7 @@ app.post('/api/pages/save', authenticateToken, async function(req, res) {
 
   if (cleanBlocks.length === 0) return res.status(400).json({ error: 'No valid blocks' });
 
-  const updateDoc = { userId: req.user.id, title: title.trim(), config: { blocks: cleanBlocks }, updatedAt: now };
+  const updateDoc = { userId: req.user.id, title: title, config: { blocks: cleanBlocks }, updatedAt: now };
   if (!shortId) updateDoc.createdAt = now;
 
   await LandingPage.findOneAndUpdate(
@@ -1484,10 +1610,17 @@ app.post('/api/pages/delete', authenticateToken, async function(req, res) {
 // ==================== FORMS WRITE ROUTES ====================
 app.post('/api/forms/save', authenticateToken, async function(req, res) {
   const shortId = req.body.shortId;
-  const title = req.body.title;
   const state = req.body.state;
   const welcomeMessage = req.body.welcomeMessage;
-  if (!title || !state) return res.status(400).json({ error: 'Title and state required' });
+  if (!state) return res.status(400).json({ error: 'Title and state required' });
+
+  const titleCheck = validateTitle(req.body.title);
+  if (!titleCheck.ok) return res.status(400).json({ error: titleCheck.error });
+  const title = titleCheck.value;
+
+  if (welcomeMessage && typeof welcomeMessage === 'string' && welcomeMessage.trim().length > WELCOME_MESSAGE_MAX_LENGTH) {
+    return res.status(400).json({ error: 'Welcome message must be ' + WELCOME_MESSAGE_MAX_LENGTH + ' characters or fewer' });
+  }
 
   const limits = getUserLimits(req.user);
 
@@ -1510,7 +1643,7 @@ app.post('/api/forms/save', authenticateToken, async function(req, res) {
   const finalShortId = shortId || uuidv4().slice(0, 8);
   const now = new Date();
 
-  const updateDoc = { userId: req.user.id, title: title.trim(), state: sanitizedState, welcomeMessage: sanitizedWelcome, updatedAt: now };
+  const updateDoc = { userId: req.user.id, title: title, state: sanitizedState, welcomeMessage: sanitizedWelcome, updatedAt: now };
   if (!shortId) updateDoc.createdAt = now;
 
   await FormPage.findOneAndUpdate(
@@ -1549,13 +1682,15 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
   try {
     const shortId = req.params.shortId;
-    const name = req.body.name;
-    const email = req.body.email;
 
-    if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
-    if (!email || !email.trim()) return res.status(400).json({ error: 'Contact is required' });
+    const nameCheck = validateName(req.body.name, 'Name');
+    if (!nameCheck.ok) return res.status(400).json({ error: nameCheck.error });
+    const name = nameCheck.value;
 
-    const contactValue = email.trim();
+    const rawContact = req.body.email;
+    if (!isNonEmptyString(rawContact)) return res.status(400).json({ error: 'Contact is required' });
+
+    const contactValue = rawContact.trim();
 
     if (!CONTACT_REGEX.test(contactValue)) {
       return res.status(400).json({ error: 'Contact must be a valid email address or phone number' });
@@ -1569,7 +1704,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
     // Compute the bot assignment ONCE here. This is the only place a fresh
     // hash-based assignment should ever happen. Once stored (below), it's locked.
-    // Keyed by owner.id + contactValue — see getBotForContact for why.
+    // Keyed by owner.id + contactValue â€” see getBotForContact for why.
     const broadcastBotEntry = botPool.getBotForContact(owner.id, contactValue);
     if (!broadcastBotEntry) {
       console.error('No broadcast bot available (pool empty) for contact ' + contactValue + ' (owner ' + owner.id + ')');
@@ -1583,11 +1718,11 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
     if (contact) {
       if (contact.status === 'subscribed') {
-        // Already subscribed elsewhere — keep their EXISTING bot assignment if they
+        // Already subscribed elsewhere â€” keep their EXISTING bot assignment if they
         // have one, don't silently move them to whatever the hash says today.
         const lockedIndex = contact.botIndex != null ? contact.botIndex : freshAssignedIndex;
 
-        contact.name = name.trim();
+        contact.name = name;
         contact.shortId = shortId;
         contact.submittedAt = new Date();
         if (contact.botIndex == null) contact.botIndex = lockedIndex;
@@ -1595,7 +1730,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
         await PendingSubscriber.create({
           payload: payload, userId: owner.id, shortId: shortId,
-          name: name.trim(), contact: contactValue, botIndex: lockedIndex
+          name: name, contact: contactValue, botIndex: lockedIndex
         });
 
         const botForLink = botPool.getBroadcastBotByIndex(lockedIndex) || broadcastBotEntry;
@@ -1603,8 +1738,8 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
         return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
       }
 
-      // Not currently subscribed (pending/unsubscribed) — fresh assignment is fine.
-      contact.name = name.trim();
+      // Not currently subscribed (pending/unsubscribed) â€” fresh assignment is fine.
+      contact.name = name;
       contact.shortId = shortId;
       contact.submittedAt = new Date();
       contact.botIndex = freshAssignedIndex;
@@ -1612,7 +1747,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
       contact = new Contact({
         userId: owner.id,
         shortId: shortId,
-        name: name.trim(),
+        name: name,
         contact: contactValue,
         status: 'pending',
         botIndex: freshAssignedIndex,
@@ -1623,7 +1758,7 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 
     await PendingSubscriber.create({
       payload: payload, userId: owner.id, shortId: shortId,
-      name: name.trim(), contact: contactValue, botIndex: freshAssignedIndex
+      name: name, contact: contactValue, botIndex: freshAssignedIndex
     });
 
     const deepLink = 'https://t.me/' + broadcastBotEntry.username + '?start=' + payload;
@@ -1639,6 +1774,12 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
 app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
   const contacts = req.body.contacts;
   if (!Array.isArray(contacts) || contacts.length === 0) return res.status(400).json({ error: 'Provide contact array' });
+  if (contacts.length > CONTACTS_DELETE_MAX) {
+    return res.status(400).json({ error: 'Cannot delete more than ' + CONTACTS_DELETE_MAX + ' contacts at once' });
+  }
+  if (!contacts.every(function(c) { return typeof c === 'string' && c.length <= EMAIL_MAX_LENGTH; })) {
+    return res.status(400).json({ error: 'Invalid contact value in list' });
+  }
 
   const result = await Contact.deleteMany({ userId: req.user.id, contact: { $in: contacts } });
 
@@ -1908,7 +2049,7 @@ app.post('/admin-limits', async function(req, res) {
   const max_pages = req.body.max_pages;
   const max_forms = req.body.max_forms;
 
-  if (password !== ADMIN_PASSWORD) {
+  if (typeof password !== 'string' || password.length > 200 || password !== ADMIN_PASSWORD) {
     return res.send('<html><body style="background:#121212;color:#f44336;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;text-align:center;"><h1>Access Denied<br>Wrong Password</h1></body></html>');
   }
 
@@ -1917,7 +2058,7 @@ app.post('/admin-limits', async function(req, res) {
   const newForms = parseInt(max_forms);
 
   if (isNaN(newDaily) || isNaN(newPages) || isNaN(newForms) || newDaily < 1 || newPages < 1 || newForms < 1) {
-    return res.send('<html><body style="background:#121212;color:#f44336;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;text-align:center;"><h1>Invalid Values<br>All limits must be ≥ 1</h1></body></html>');
+    return res.send('<html><body style="background:#121212;color:#f44336;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;text-align:center;"><h1>Invalid Values<br>All limits must be â‰¥ 1</h1></body></html>');
   }
 
   try {
@@ -1952,7 +2093,7 @@ app.post('/admin-limits', async function(req, res) {
       '    <p><strong>Daily Broadcasts:</strong> ' + newDaily + '<br>\n' +
       '       <strong>Max Pages:</strong> ' + newPages + '<br>\n' +
       '       <strong>Max Forms:</strong> ' + newForms + '</p>\n' +
-      '    <p><a href="/admin-limits">← Back to Control Panel</a></p>\n' +
+      '    <p><a href="/admin-limits">â† Back to Control Panel</a></p>\n' +
       '  </div>\n' +
       '</body>\n' +
       '</html>');
@@ -1971,7 +2112,7 @@ async function loadAdminSettings() {
       maxLandingPages: settings.maxLandingPages,
       maxForms: settings.maxForms
     };
-    console.log('✅ Admin settings loaded from DB:', adminSettingsCache);
+    console.log('âœ… Admin settings loaded from DB:', adminSettingsCache);
   } catch (err) {
     console.error('Failed to load admin settings:', err);
   }
@@ -1986,7 +2127,7 @@ mongoose.connection.once('open', async function() {
     registerAuthBotHandlers(botPool.authBot);
     await setupAuthWebhook();
     authBotReady = true;
-    console.log('✅ Auth bot fully ready — login/2FA is live.');
+    console.log('âœ… Auth bot fully ready â€” login/2FA is live.');
 
     // ---- Phase 2: Broadcast pool. Separate lifecycle.
     await initBroadcastPool();
@@ -2001,7 +2142,7 @@ mongoose.connection.once('open', async function() {
     await recoverLostScheduledBroadcasts();
 
     serverReady = true;
-    console.log('✅ Startup sequence completed — server is now accepting all bot-dependent requests');
+    console.log('âœ… Startup sequence completed â€” server is now accepting all bot-dependent requests');
   } catch (err) {
     console.error('FATAL: startup sequence failed, exiting:', err.message);
     process.exit(1);
@@ -2024,7 +2165,7 @@ process.on('SIGINT', async function() {
 
 // Render (and any uptime monitor) pings bare GET/HEAD / by default.
 // Without an explicit route here it falls through to the 404 catch-all
-// and spams the deploy logs every few seconds — this is just a cheap,
+// and spams the deploy logs every few seconds â€” this is just a cheap,
 // no-DB-touching health response so that noise stops.
 app.get('/', function(req, res) {
   res.status(200).type('text/plain').send('Sendm is running [' + BUILD_TAG + ']');
@@ -2042,6 +2183,6 @@ app.use(function(req, res) {
 });
 
 app.listen(PORT, function() {
-  console.log('\nSENDM SERVER — SHARED BOT-POOL MODEL (auth bot + broadcast pool)');
+  console.log('\nSENDM SERVER â€” SHARED BOT-POOL MODEL (auth bot + broadcast pool)');
   console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
