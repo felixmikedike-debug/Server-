@@ -918,7 +918,7 @@ async function processBroadcast(job) {
   // Signature is prepended ONCE, before splitting into chunks, so it only
   // ever appears at the very top of the first message part â€” never repeated
   // on "(2/3)"-style continuation chunks.
-  const signedMessage = 'âœ¨ From ' + senderName + '\n\n' + message;
+  const signedMessage = '🚀  From ' + senderName + '\n\n' + message;
   const chunks = splitTelegramMessage(signedMessage);
 
   const targets = await Contact.find({
