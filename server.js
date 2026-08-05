@@ -947,7 +947,7 @@ async function processBroadcast(job) {
   if (total === 0) {
     reportText += 'No subscribed contacts with Telegram connected.';
   } else {
-    const emoji = stats.failed === 0 ? 'âœ…' : 'âš ï¸';
+    const emoji = stats.failed === 0 ? '🎉' : '🛑';
     reportText += emoji + ' <b>' + stats.sent + ' of ' + total + '</b> delivered.\n';
     if (stats.failed > 0) reportText += stats.failed + ' failed.';
   }
