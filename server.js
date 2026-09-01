@@ -13,6 +13,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const IORedis = require('ioredis');
 const { Queue, Worker } = require('bullmq');
+const sanitizeHtml = require('sanitize-html');
 
 // Bump this string any time you deploy a fix and want an unambiguous way
 // to confirm from the OUTSIDE (via /ping or the boot logs) that the
@@ -40,6 +41,16 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_fallback
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'midas';
 const DOMAIN = process.env.DOMAIN;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+// Shared Paystack account model: this single /api/subscription/webhook
+// endpoint may receive charge events that were actually initiated by a
+// DIFFERENT product on the same Paystack account. Every payment this app
+// initiates is tagged with metadata.app = PAYSTACK_APP_TAG at initiate time.
+// At webhook time, any event whose metadata.app does NOT match gets
+// forwarded verbatim (raw body + original signature header) to
+// OTHER_SAAS_WEBHOOK_URL instead of being processed here.
+const PAYSTACK_APP_TAG = process.env.PAYSTACK_APP_TAG || 'sendm';
+const OTHER_SAAS_WEBHOOK_URL = process.env.OTHER_SAAS_WEBHOOK_URL || '';
 
 if (!DOMAIN) {
   console.error('ERROR: DOMAIN environment variable is required for webhooks!');
@@ -617,6 +628,53 @@ function sanitizeTelegramHtml(unsafe) {
   return clean.trim();
 }
 
+// Sanitizes the raw HTML a user pastes/builds into a landing page "form"
+// block. This HTML is rendered on the PUBLIC /p/:shortId page for anyone
+// who visits it, so unlike sanitizeTelegramHtml (which only ever reaches
+// Telegram's own renderer) this is a real browser-facing XSS surface.
+// Previously this only stripped <script> tags via regex, which does nothing
+// against onerror=, javascript: hrefs, <iframe>, <object>, etc. sanitize-html
+// is a real parser-based sanitizer, not a regex blocklist, so it isn't
+// bypassable the same way.
+const FORM_BLOCK_ALLOWED_TAGS = [
+  'form', 'label', 'input', 'select', 'option', 'textarea', 'button',
+  'div', 'span', 'p', 'br', 'strong', 'em', 'b', 'i', 'u', 'small',
+  'ul', 'ol', 'li', 'a', 'img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'
+];
+
+const FORM_BLOCK_ALLOWED_ATTRIBUTES = {
+  '*': ['class', 'id', 'style'],
+  form: ['action', 'method', 'name'],
+  input: ['type', 'name', 'placeholder', 'required', 'value', 'checked', 'min', 'max', 'maxlength', 'pattern'],
+  select: ['name', 'required'],
+  option: ['value', 'selected'],
+  textarea: ['name', 'placeholder', 'required', 'maxlength'],
+  button: ['type'],
+  a: ['href', 'target', 'rel'],
+  img: ['src', 'alt', 'width', 'height']
+};
+
+function sanitizeLandingPageFormHtml(rawHtml) {
+  if (!rawHtml || typeof rawHtml !== 'string') return '';
+  return sanitizeHtml(rawHtml, {
+    allowedTags: FORM_BLOCK_ALLOWED_TAGS,
+    allowedAttributes: FORM_BLOCK_ALLOWED_ATTRIBUTES,
+    // Only allow href/src to actually point somewhere safe - blocks
+    // javascript:, data:, vbscript:, etc.
+    allowedSchemes: ['http', 'https', 'mailto'],
+    allowProtocolRelative: false,
+    // Belt-and-suspenders: sanitize-html already drops on* attributes
+    // because they're not in allowedAttributes, and drops <style>/<script>
+    // because they're not in allowedTags, but disallowedTagsMode 'discard'
+    // (the default) makes that explicit rather than relying on defaults.
+    disallowedTagsMode: 'discard',
+    // When a disallowed tag like <style>/<script>/<noscript> is stripped,
+    // also drop its inner text instead of leaving the raw JS/CSS behind as
+    // a text node.
+    nonTextTags: ['style', 'script', 'noscript']
+  }).trim();
+}
+
 function textToHtmlForDisplay(text) {
   if (!text) return '';
   return text.replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>');
@@ -1065,7 +1123,15 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use(express.static('public'));
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// `verify` stashes the exact raw bytes Express received BEFORE JSON parsing/
+// re-serialization touches them. Paystack signs those exact raw bytes, so
+// re-deriving JSON.stringify(req.body) later can drift (key order, number
+// formatting) and cause valid webhooks to fail signature checks. Only the
+// webhook route uses req.rawBody; every other route is unaffected.
+app.use(express.json({
+  limit: '10mb',
+  verify: function(req, res, buf) { req.rawBody = buf; }
+}));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 const authLimiter = rateLimit({
@@ -1329,7 +1395,9 @@ app.post('/api/subscription/initiate', authenticateToken, async function(req, re
         amount: MONTHLY_PRICE_KOBO,
         currency: 'NGN',
         callback_url: req.protocol + '://' + req.get('host') + '/subscription-success',
-        metadata: { userId: req.user.id, plan: 'premium-monthly' }
+        // app tag lets the shared webhook endpoint tell this product's
+        // payments apart from any other SaaS sharing the same Paystack account.
+        metadata: { userId: req.user.id, plan: 'premium-monthly', app: PAYSTACK_APP_TAG }
       },
       { headers: { Authorization: 'Bearer ' + PAYSTACK_SECRET_KEY, 'Content-Type': 'application/json' } }
     );
@@ -1347,17 +1415,58 @@ app.post('/api/subscription/initiate', authenticateToken, async function(req, re
   }
 });
 
+// Forwards a webhook we don't own to the other SaaS, unmodified. We pass the
+// exact raw bytes Paystack sent (not a re-serialized copy) plus the original
+// signature header, so the downstream app can independently verify it against
+// its own copy of the shared Paystack secret exactly as if Paystack had hit
+// it directly. Best-effort: Paystack only cares that WE return 200 quickly,
+// so a forwarding failure is logged, not surfaced back to Paystack (which
+// would just trigger pointless retries against us).
+async function forwardWebhookToOtherSaas(rawBody, signatureHeader) {
+  if (!OTHER_SAAS_WEBHOOK_URL) {
+    console.warn('[webhook] Received an event not tagged for this app, but OTHER_SAAS_WEBHOOK_URL is not set - dropping it.');
+    return;
+  }
+  try {
+    await axios.post(OTHER_SAAS_WEBHOOK_URL, rawBody, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-paystack-signature': signatureHeader
+      },
+      timeout: 10000
+    });
+    console.log('[webhook] Forwarded untagged event to other SaaS');
+  } catch (err) {
+    console.error('[webhook] Failed to forward event to other SaaS:', err.message);
+  }
+}
+
 app.post('/api/subscription/webhook', async function(req, res) {
   try {
+    // req.rawBody is the exact byte stream Paystack sent (see the verify()
+    // hook on express.json() above). Signing THAT, not a re-serialized
+    // JSON.stringify(req.body), is what makes this check reliable.
+    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+    const signatureHeader = req.headers['x-paystack-signature'];
+
     const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY)
-      .update(JSON.stringify(req.body))
+      .update(rawBody)
       .digest('hex');
 
-    if (hash !== req.headers['x-paystack-signature']) {
+    if (!signatureHeader || hash !== signatureHeader) {
       return res.status(401).send('Invalid signature');
     }
 
     const event = req.body;
+    const eventAppTag = event && event.data && event.data.metadata && event.data.metadata.app;
+
+    // Not ours - hand it off to whichever other SaaS is sharing this
+    // Paystack account and ack Paystack immediately so it doesn't retry.
+    if (eventAppTag !== PAYSTACK_APP_TAG) {
+      res.status(200).send('OK');
+      await forwardWebhookToOtherSaas(rawBody, signatureHeader);
+      return;
+    }
 
     if (event.event === 'charge.success') {
       const reference = event.data.reference;
@@ -1390,7 +1499,7 @@ app.post('/api/subscription/webhook', async function(req, res) {
 });
 
 app.get('/subscription-success', function(req, res) {
-  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendi.onrender.com">Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
+  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendmi.onrender.com">Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
 });
 
 // ==================== CACHED HIGH-READ ENDPOINTS ====================
@@ -1570,7 +1679,7 @@ app.post('/api/pages/save', authenticateToken, async function(req, res) {
     if (b.type === 'text') return { type: 'text', tag: b.tag || 'p', content: (b.content || '').trim() };
     if (b.type === 'image') return b.src ? { type: 'image', src: b.src.trim() } : null;
     if (b.type === 'button') return b.text ? { type: 'button', text: b.text.trim(), href: b.href || '' } : null;
-    if (b.type === 'form') return b.html ? { type: 'form', html: b.html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '') } : null;
+    if (b.type === 'form') return b.html ? { type: 'form', html: sanitizeLandingPageFormHtml(b.html) } : null;
     return null;
   }).filter(Boolean);
 
